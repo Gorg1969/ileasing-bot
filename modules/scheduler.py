@@ -90,8 +90,11 @@ def mark_listing_published(url: str):
 
 
 def download_image(url: str) -> bytes:
+    """Скачивает фото по URL с подробным логированием."""
     try:
+        logger.info(f"⬇️ Скачиваю фото: {url}")
         r = requests.get(url, timeout=30, verify=False)
+        logger.info(f"⬇️ HTTP {r.status_code}, размер: {len(r.content)} байт")
         if r.status_code == 200:
             return r.content
         logger.warning(f"⚠️ Фото {url}: HTTP {r.status_code}")
@@ -117,20 +120,33 @@ def publish_random_post(force: bool = False):
 
     logger.info(f"📦 Выбрана карточка: {listing['title']}")
 
-    post_text = _description_gen.generate_post(listing)
-
+    # ============ ФОТО: ДИАГНОСТИКА ============
     image_token = None
-    if listing.get("image"):
-        image_bytes = download_image(listing["image"])
+    image_url = listing.get("image")
+    logger.info(f"🖼️ image URL из БД: {image_url!r}")
+
+    if image_url:
+        image_bytes = download_image(image_url)
+        logger.info(f"📥 Скачано байт: {len(image_bytes) if image_bytes else 0}")
+
         if image_bytes:
             image_token = _api.upload_file(image_bytes, "photo.jpg")
+            logger.info(f"🎫 Токен после upload: {image_token!r}")
+        else:
+            logger.error(f"❌ Не удалось скачать фото: {image_url}")
+    else:
+        logger.warning("⚠️ В БД нет URL фото для этой карточки")
+
+    logger.info(f"🧪 Итог: image_token={'ЕСТЬ' if image_token else 'НЕТ'}")
+    # ==========================================
+
+    post_text = _description_gen.generate_post(listing)
 
     # ============ TEST_MODE ============
     test_mode = os.environ.get("TEST_MODE", "false").lower() == "true"
     target_chat = CHAT_ID
 
     if test_mode:
-        # Читаем admin_id из файла
         admin_file = os.path.join(os.environ.get("DATA_DIR", "/app/data"), "admin_id.txt")
         try:
             if os.path.exists(admin_file):
@@ -146,9 +162,10 @@ def publish_random_post(force: bool = False):
 
     # ============ ПУБЛИКАЦИЯ ============
     if image_token:
+        logger.info(f"📤 Отправка с фото в {target_chat}")
         ok = _api.send_message_with_attachments(target_chat, post_text, [image_token])
     else:
-        # Для лички используем send_message, для канала — send_message_to_chat
+        logger.info(f"📤 Отправка БЕЗ фото в {target_chat}")
         if test_mode:
             ok = _api.send_message(int(target_chat), post_text)
         else:
