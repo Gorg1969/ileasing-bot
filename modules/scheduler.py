@@ -90,11 +90,40 @@ def mark_listing_published(url: str):
 
 
 def download_image(url: str) -> bytes:
-    """Скачивает фото по URL с подробным логированием."""
+    """Скачивает фото по URL с заголовками браузера и диагностикой формата."""
     try:
         logger.info(f"⬇️ Скачиваю фото: {url}")
-        r = requests.get(url, timeout=30, verify=False)
-        logger.info(f"⬇️ HTTP {r.status_code}, размер: {len(r.content)} байт")
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            "Referer": "https://www.ileasing.ru/",
+        }
+        r = requests.get(url, headers=headers, timeout=30, verify=False)
+
+        content_type = r.headers.get("Content-Type", "неизвестно")
+        logger.info(f"⬇️ HTTP {r.status_code}, Content-Type: {content_type}, размер: {len(r.content)} байт")
+
+        if r.content and len(r.content) >= 12:
+            logger.info(f"⬇️ Первые 12 байт (hex): {r.content[:12].hex()}")
+
+            # Определяем формат по сигнатуре
+            sig = r.content[:12]
+            if sig[:3] == b'\xff\xd8\xff':
+                logger.info("✅ Формат: JPEG")
+            elif sig[:4] == b'RIFF' and sig[8:12] == b'WEBP':
+                logger.warning("⚠️ Формат: WebP (MAX его не принимает!)")
+            elif sig[:8] == b'\x89PNG\r\n\x1a\n':
+                logger.info("✅ Формат: PNG")
+            elif sig[:3] == b'GIF':
+                logger.info("✅ Формат: GIF")
+            else:
+                logger.warning(f"⚠️ Неизвестный формат, первые байты: {sig.hex()}")
+
         if r.status_code == 200:
             return r.content
         logger.warning(f"⚠️ Фото {url}: HTTP {r.status_code}")
