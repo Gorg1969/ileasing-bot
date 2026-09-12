@@ -6,8 +6,9 @@ Flask + веб-интерфейс + форма консультации + пла
 Особенности:
 - ADMIN_USER_ID определяется автоматически: первый, кто напишет /start, становится админом.
 - ID сохраняется в data/admin_id.txt
-- Доступ к боту имеют только админ. Остальные видят "Доступ ограничен".
-- Сбросить админа: /admin_reset (только текущий админ)
+- Доступ к боту имеют только админ.
+- TEST_MODE=true — посты идут в личку админу (для отладки)
+- Страница /admin — ручное управление публикацией
 """
 
 from flask import Flask, request, jsonify, render_template_string
@@ -51,7 +52,7 @@ if not TOKEN:
 # ========== ОПРЕДЕЛЕНИЕ АДМИНА ==========
 
 def get_admin_id():
-    """Читает ID админа из файла. Возвращает None, если не задан."""
+    """Читает ID админа из файла."""
     try:
         if os.path.exists(ADMIN_ID_FILE):
             with open(ADMIN_ID_FILE, "r") as f:
@@ -190,7 +191,6 @@ class APIClient:
             return None
 
     def delete_message(self, message_id):
-        """Удаляет сообщение из канала."""
         if not self.token or not message_id:
             return False
         try:
@@ -204,7 +204,7 @@ class APIClient:
             if response.status_code == 200:
                 logger.info(f"🗑️ Удалено сообщение {message_id}")
                 return True
-            logger.error(f"❌ Ошибка удаления {message_id}: {response.status_code} - {response.text}")
+            logger.error(f"❌ Ошибка удаления {message_id}: {response.status_code}")
             return False
         except Exception as e:
             logger.error(f"❌ Ошибка удаления: {e}")
@@ -327,14 +327,154 @@ CONSULTATION_PAGE = """
 """
 
 
+# ========== HTML АДМИН-ПАНЕЛИ ==========
+
+ADMIN_PAGE = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Админ-панель бота</title>
+    <style>
+        body { font-family: -apple-system, Arial, sans-serif; background: #f0f2f5; margin: 0; padding: 20px; }
+        .container { max-width: 700px; margin: 30px auto; }
+        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); margin-bottom: 20px; }
+        h1 { color: #1a1a1a; margin-top: 0; font-size: 22px; }
+        h2 { color: #333; font-size: 16px; margin-top: 0; }
+        .status-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #eee; font-size: 14px; }
+        .status-row:last-child { border-bottom: none; }
+        .status-label { color: #666; }
+        .status-value { font-weight: 600; color: #1a1a1a; }
+        .btn { padding: 12px 24px; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; margin-right: 10px; margin-bottom: 10px; transition: all 0.2s; }
+        .btn-primary { background: #007bff; color: white; }
+        .btn-primary:hover { background: #0056b3; }
+        .btn-secondary { background: #6c757d; color: white; }
+        .btn-secondary:hover { background: #545b62; }
+        .btn-warning { background: #ffc107; color: #333; }
+        .btn-warning:hover { background: #e0a800; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .log { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 8px; font-family: 'Courier New', monospace; font-size: 12px; max-height: 300px; overflow-y: auto; margin-top: 15px; white-space: pre-wrap; line-height: 1.5; }
+        .mode-badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; margin-left: 10px; }
+        .mode-test { background: #fff3cd; color: #856404; }
+        .mode-live { background: #d4edda; color: #155724; }
+        .warning { background: #fff3cd; padding: 12px 15px; border-radius: 8px; border-left: 4px solid #ffc107; margin-bottom: 15px; font-size: 14px; color: #856404; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>🎛️ Админ-панель бота</h1>
+            <div id="modeInfo"></div>
+        </div>
+
+        <div class="card">
+            <h2>📊 Статистика</h2>
+            <div id="stats">Загрузка...</div>
+        </div>
+
+        <div class="card">
+            <h2>🚀 Ручное управление</h2>
+            <div class="warning">
+                ⚠️ Кнопка «Опубликовать сейчас» запустит публикацию немедленно.<br>
+                Если <strong>TEST_MODE=true</strong> — пост придёт вам в личку, а не в канал.
+            </div>
+            <button class="btn btn-primary" onclick="publishNow()">🚀 Опубликовать сейчас</button>
+            <button class="btn btn-secondary" onclick="refreshListings()">🔄 Обновить listings.db</button>
+            <button class="btn btn-warning" onclick="cleanupOld()">🗑️ Очистить старые посты</button>
+            <div id="log" class="log" style="display:none;"></div>
+        </div>
+    </div>
+
+    <script>
+        const logDiv = document.getElementById('log');
+
+        function addLog(text) {
+            logDiv.style.display = 'block';
+            logDiv.textContent += new Date().toLocaleTimeString() + ' → ' + text + '\\n';
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        async function loadStats() {
+            try {
+                const r = await fetch('/admin_stats');
+                const d = await r.json();
+
+                const modeBadge = d.test_mode
+                    ? '<span class="mode-badge mode-test">🧪 ТЕСТОВЫЙ РЕЖИМ</span>'
+                    : '<span class="mode-badge mode-live">🔴 БОЕВОЙ РЕЖИМ</span>';
+
+                document.getElementById('modeInfo').innerHTML =
+                    '<div style="font-size:14px;color:#666;">' +
+                    'Режим работы: ' + modeBadge +
+                    (d.test_mode ? '<br><small>Посты идут в личку админу, канал не затрагивается.</small>'
+                                 : '<br><small>Посты публикуются в канал: <code>' + d.channel_id + '</code></small>') +
+                    '</div>';
+
+                document.getElementById('stats').innerHTML =
+                    '<div class="status-row"><span class="status-label">📦 Опубликовано</span><span class="status-value">' + d.published_total + '</span></div>' +
+                    '<div class="status-row"><span class="status-label">⏳ В очереди (pending)</span><span class="status-value">' + d.pending + '</span></div>' +
+                    '<div class="status-row"><span class="status-label">📊 Всего в listings.db</span><span class="status-value">' + d.listings_total + '</span></div>' +
+                    '<div class="status-row"><span class="status-label">👤 Админ ID</span><span class="status-value">' + (d.admin_id || '—') + '</span></div>';
+            } catch (e) {
+                document.getElementById('stats').textContent = 'Ошибка загрузки: ' + e.message;
+            }
+        }
+
+        async function publishNow() {
+            addLog('🚀 Запуск публикации...');
+            try {
+                const r = await fetch('/manual_publish', {method: 'POST'});
+                const d = await r.json();
+                addLog(d.success ? '✅ ' + d.message : '❌ ' + d.message);
+                loadStats();
+            } catch (e) {
+                addLog('❌ Ошибка: ' + e.message);
+            }
+        }
+
+        async function refreshListings() {
+            addLog('🔄 Обновление listings.db...');
+            try {
+                const r = await fetch('/refresh_listings', {method: 'POST'});
+                const d = await r.json();
+                addLog(d.success ? '✅ listings.db обновлена' : '❌ Не удалось обновить');
+                loadStats();
+            } catch (e) {
+                addLog('❌ Ошибка: ' + e.message);
+            }
+        }
+
+        async function cleanupOld() {
+            addLog('🗑️ Запуск очистки...');
+            try {
+                const r = await fetch('/manual_cleanup', {method: 'POST'});
+                const d = await r.json();
+                addLog(d.success ? '✅ ' + d.message : '❌ ' + d.message);
+                loadStats();
+            } catch (e) {
+                addLog('❌ Ошибка: ' + e.message);
+            }
+        }
+
+        loadStats();
+        setInterval(loadStats, 30000);
+    </script>
+</body>
+</html>
+"""
+
+
 # ========== МАРШРУТЫ ==========
 
 @app.route('/')
 def index():
     admin_id = get_admin_id()
+    test_mode = os.environ.get("TEST_MODE", "false").lower() == "true"
     return jsonify({
         "status": "running",
         "admin_configured": admin_id is not None,
+        "test_mode": test_mode,
     })
 
 
@@ -348,9 +488,47 @@ def consultation_page():
     return render_template_string(CONSULTATION_PAGE)
 
 
+@app.route('/admin', methods=['GET'])
+def admin_page():
+    return render_template_string(ADMIN_PAGE)
+
+
+@app.route('/admin_stats')
+def admin_stats():
+    """Статистика для админ-панели."""
+    try:
+        published_stats = db.stats()
+        admin_id = get_admin_id()
+
+        # Статистика по listings.db
+        listings_total = 0
+        pending = 0
+        try:
+            import sqlite3
+            listings_path = os.path.join(DATA_DIR, "listings.db")
+            if os.path.exists(listings_path):
+                conn = sqlite3.connect(listings_path, timeout=10)
+                conn.row_factory = sqlite3.Row
+                listings_total = conn.execute("SELECT COUNT(*) as c FROM listings").fetchone()["c"]
+                pending = conn.execute("SELECT COUNT(*) as c FROM listings WHERE status='pending'").fetchone()["c"]
+                conn.close()
+        except Exception as e:
+            logger.error(f"Ошибка чтения listings.db: {e}")
+
+        return jsonify({
+            "published_total": published_stats.get("published_total", 0),
+            "listings_total": listings_total,
+            "pending": pending,
+            "admin_id": admin_id,
+            "channel_id": CHANNEL_ID,
+            "test_mode": os.environ.get("TEST_MODE", "false").lower() == "true",
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/submit_consultation', methods=['POST'])
 def submit_consultation():
-    """Принимает заявку с формы, отправляет админу в личку MAX."""
     try:
         data = request.get_json()
         if not data:
@@ -367,7 +545,6 @@ def submit_consultation():
         admin_id = get_admin_id()
 
         if admin_id is None:
-            logger.warning(f"⚠️ Admin ID не задан. Заявка #{consultation_id} сохранена.")
             return jsonify({'success': True, 'message': 'Заявка сохранена.'})
 
         text = (
@@ -381,9 +558,6 @@ def submit_consultation():
 
         if sent:
             db.mark_consultation_sent(consultation_id)
-            logger.info(f"✅ Заявка #{consultation_id} отправлена админу {admin_id}")
-        else:
-            logger.error(f"❌ Не удалось отправить заявку #{consultation_id}")
 
         return jsonify({
             'success': True,
@@ -392,15 +566,11 @@ def submit_consultation():
         })
 
     except Exception as e:
-        logger.error(f"❌ Ошибка приёма заявки: {e}")
-        import traceback
-        traceback.print_exc()
         return jsonify({'success': False, 'message': str(e)}), 500
 
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Обрабатывает события от MAX."""
     try:
         data = request.get_json()
         if not data:
@@ -410,85 +580,69 @@ def webhook():
 
         if update_type == 'message_created':
             message = data.get('message', {})
-            recipient = message.get('recipient', {})
             sender = message.get('sender', {})
             body = message.get('body', {})
 
-            chat_id = recipient.get('chat_id')
             user_id = sender.get('user_id')
             text = body.get('text', '').strip() if body.get('text') else ''
-            message_id = body.get('mid')
 
             logger.info(f"📨 user_id={user_id}, text={text}")
 
-            # ============ ЗАЩИТА: игнорируем всех, кроме админа ============
             current_admin = get_admin_id()
 
-            # Если админ ещё не задан — первый, кто написал /start, становится им
             if current_admin is None and text == '/start' and user_id:
                 save_admin_id(user_id)
                 api.send_message(
                     user_id,
                     "✅ **Вы зарегистрированы как администратор!**\n\n"
-                    "Теперь сюда будут приходить заявки с формы консультации.\n\n"
                     "Команды:\n"
-                    "/start — это меню\n"
+                    "/start — меню\n"
                     "/admin_reset — сбросить админа\n"
-                    "/status — статус бота"
+                    "/status — статус"
                 )
                 return jsonify({"ok": True}), 200
 
-            # Все остальные — игнорируются
             if not is_admin(user_id):
-                logger.info(f"⛔ Игнорирую не-админа {user_id}")
                 return jsonify({"ok": True}), 200
-
-            # ============ ТОЛЬКО ДЛЯ АДМИНА ============
 
             if text == '/start':
                 api.send_message(
                     user_id,
-                    "🏠 **Главное меню**\n\n"
-                    f"📝 Записаться на консультацию:\n"
-                    f"https://{request.host}/consultation"
+                    f"🏠 **Главное меню**\n\n"
+                    f"🎛️ Админ-панель: https://{request.host}/admin\n"
+                    f"📝 Форма консультации: https://{request.host}/consultation"
                 )
                 return jsonify({"ok": True}), 200
 
             if text == '/admin_reset':
                 if os.path.exists(ADMIN_ID_FILE):
                     os.remove(ADMIN_ID_FILE)
-                api.send_message(
-                    user_id,
-                    "🗑️ **Admin ID сброшен.**\n\n"
-                    "Следующий, кто напишет /start, станет админом."
-                )
+                api.send_message(user_id, "🗑️ Admin ID сброшен.")
                 return jsonify({"ok": True}), 200
 
             if text == '/status':
                 stats = db.stats()
+                test_mode = os.environ.get("TEST_MODE", "false").lower() == "true"
                 api.send_message(
                     user_id,
                     f"📊 **Статус бота**\n\n"
                     f"📦 Опубликовано: {stats.get('published_total', 0)}\n"
-                    f"📡 Канал: `{CHANNEL_ID}`"
+                    f"📡 Канал: `{CHANNEL_ID}`\n"
+                    f"🧪 Тестовый режим: {'ДА' if test_mode else 'НЕТ'}"
                 )
                 return jsonify({"ok": True}), 200
 
-            # Неизвестная команда — молчим
             return jsonify({"ok": True}), 200
 
         return jsonify({"ok": True}), 200
 
     except Exception as e:
         logger.error(f"❌ Ошибка в вебхуке: {e}")
-        import traceback
-        traceback.print_exc()
         return jsonify({"ok": False}), 500
 
 
 @app.route('/setup_webhook')
 def setup_webhook():
-    """Настраивает вебхук MAX."""
     token = request.args.get('token') or TOKEN
     if not token:
         return "❌ Токен не найден", 400
@@ -517,17 +671,17 @@ def setup_webhook():
 
 @app.route('/manual_publish', methods=['POST'])
 def manual_publish():
-    """Ручной запуск публикации (для отладки)."""
+    """Ручной запуск публикации."""
     try:
-        sched_module.publish_random_post()
+        sched_module.publish_random_post(force=True)
         return jsonify({'success': True, 'message': 'Публикация запущена'})
     except Exception as e:
+        logger.error(f"❌ Ошибка ручной публикации: {e}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
 
 @app.route('/manual_cleanup', methods=['POST'])
 def manual_cleanup():
-    """Ручной запуск очистки старых постов."""
     try:
         sched_module.cleanup_old_posts()
         return jsonify({'success': True, 'message': 'Очистка запущена'})
@@ -537,7 +691,6 @@ def manual_cleanup():
 
 @app.route('/refresh_listings', methods=['POST'])
 def refresh_listings_route():
-    """Ручное обновление listings.db."""
     try:
         ok = sched_module.refresh_listings()
         return jsonify({'success': ok})
@@ -550,10 +703,13 @@ if __name__ == "__main__":
     if TOKEN:
         logger.info(f"✅ Токен найден (первые 10): {TOKEN[:10]}...")
 
+    test_mode = os.environ.get("TEST_MODE", "false").lower() == "true"
+    logger.info(f"🧪 TEST_MODE: {test_mode}")
+
     admin_id = get_admin_id()
     if admin_id:
         logger.info(f"✅ Admin ID: {admin_id}")
     else:
-        logger.info("ℹ️ Admin ID не задан. Напишите боту /start, чтобы зарегистрироваться как админ.")
+        logger.info("ℹ️ Admin ID не задан. Напишите боту /start.")
 
     app.run(host='0.0.0.0', port=port, threaded=True)
