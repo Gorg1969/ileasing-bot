@@ -7,9 +7,7 @@ SQLite-обёртка для парсера.
 
 import sqlite3
 import os
-import json
 import logging
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +19,9 @@ class ParserDB:
         self._init_schema()
 
     def _connect(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
     def _init_schema(self):
@@ -55,11 +54,14 @@ class ParserDB:
 
     def listing_exists(self, url: str) -> bool:
         """Проверяет, есть ли карточка с таким URL."""
-        with self._connect() as conn:
+        conn = self._connect()
+        try:
             row = conn.execute(
                 "SELECT 1 FROM listings WHERE url = ? LIMIT 1", (url,)
             ).fetchone()
             return row is not None
+        finally:
+            conn.close()
 
     def add_listing(
         self,
@@ -80,7 +82,8 @@ class ParserDB:
     ) -> bool:
         """Добавляет новую карточку. Возвращает True, если добавлена."""
         try:
-            with self._connect() as conn:
+            conn = self._connect()
+            try:
                 conn.execute("""
                     INSERT INTO listings (
                         external_id, url, title, price, price_value, leasing,
@@ -94,20 +97,26 @@ class ParserDB:
                 ))
                 conn.commit()
                 return True
+            finally:
+                conn.close()
         except sqlite3.IntegrityError:
             # Уже есть — не ошибка
             return False
 
     def count_pending(self) -> int:
-        with self._connect() as conn:
+        conn = self._connect()
+        try:
             row = conn.execute(
                 "SELECT COUNT(*) as c FROM listings WHERE status = 'pending'"
             ).fetchone()
             return row["c"] if row else 0
+        finally:
+            conn.close()
 
     def get_pending(self, limit: int = 20) -> list:
         """Возвращает список pending-карточек (для отладки)."""
-        with self._connect() as conn:
+        conn = self._connect()
+        try:
             rows = conn.execute("""
                 SELECT * FROM listings
                 WHERE status = 'pending'
@@ -115,11 +124,34 @@ class ParserDB:
                 LIMIT ?
             """, (limit,)).fetchall()
             return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def mark_published(self, url: str) -> bool:
+        """Помечает карточку как опубликованную."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE listings SET status = 'published' WHERE url = ?",
+                (url,)
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
 
     def stats(self) -> dict:
-        with self._connect() as conn:
-            total = conn.execute("SELECT COUNT(*) as c FROM listings").fetchone()["c"]
+        conn = self._connect()
+        try:
+            total = conn.execute(
+                "SELECT COUNT(*) as c FROM listings"
+            ).fetchone()["c"]
             pending = conn.execute(
                 "SELECT COUNT(*) as c FROM listings WHERE status = 'pending'"
             ).fetchone()["c"]
-            return {"total": total, "pending": pending}
+            published = conn.execute(
+                "SELECT COUNT(*) as c FROM listings WHERE status = 'published'"
+            ).fetchone()["c"]
+            return {"total": total, "pending": pending, "published": published}
+        finally:
+            conn.close()
