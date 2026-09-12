@@ -10,6 +10,7 @@
 5. Цель — 20 новых карточек за запуск. Лимит — 5 категорий.
 """
 
+import os
 import re
 import random
 import logging
@@ -27,6 +28,7 @@ TARGET_NEW = 20
 MAX_CATEGORIES = 5
 
 ALLOWED_CATEGORIES = [
+    # Легковой транспорт
     "/catalog/car/sedan/",
     "/catalog/car/universal/",
     "/catalog/car/hetchbek/",
@@ -35,16 +37,20 @@ ALLOWED_CATEGORIES = [
     "/catalog/car/kupe/",
     "/catalog/car/liftbek/",
     "/catalog/car/miniven/",
+    # Легкий коммерческий транспорт
     "/catalog/commercial-vehicles/furgon/",
     "/catalog/commercial-vehicles/bortovye/",
     "/catalog/commercial-vehicles/pikap/",
     "/catalog/commercial-vehicles/shassi/",
+    # Грузовая техника
     "/catalog/freight-transport/gruzovye-avtomobili/",
     "/catalog/freight-transport/pritsepy-i-polupritsepy/",
     "/catalog/freight-transport/sedelnye-tyagachi/",
+    # Автобусы
     "/catalog/bus/avtobusy/",
     "/catalog/bus/mikroavtobusy/",
     "/catalog/bus/vakhtovye-avtobusy/",
+    # Сельхозтехника
     "/catalog/agricultural-machinery/kombayny/",
     "/catalog/agricultural-machinery/traktory/",
     "/catalog/agricultural-machinery/borony/",
@@ -54,6 +60,7 @@ ALLOWED_CATEGORIES = [
     "/catalog/agricultural-machinery/polivalnye-mashiny/",
     "/catalog/agricultural-machinery/posevnoe-oborudovanie/",
     "/catalog/agricultural-machinery/pr-selkhoztekhnika/",
+    # Спецтехника (без горнодобывающей)
     "/catalog/special-machinery/dorozhno-stroitelnaya-tekhnika/",
     "/catalog/special-machinery/kommunalnaya-tekhnika/",
     "/catalog/special-machinery/spetsializirovannaya-tekhnika/",
@@ -63,7 +70,7 @@ ALLOWED_CATEGORIES = [
 
 
 def parse_price(text: str) -> Optional[int]:
-    """'от 3 243 427 ₽' -> 3243427."""
+    """'от 3 243 427 ₽' -> 3243427. Возвращает None, если не распарсить."""
     if not text:
         return None
     digits = re.sub(r"[^\d]", "", text)
@@ -76,6 +83,7 @@ class ILeasingParser:
         self.headless = headless
 
     async def run(self) -> dict:
+        """Главный метод. Возвращает статистику."""
         stats = {
             "categories_tried": 0,
             "pages_visited": 0,
@@ -123,6 +131,7 @@ class ILeasingParser:
         return stats
 
     async def _process_category(self, page: Page, category: str, stats: dict):
+        """Обходит страницы одной категории, пока не наберём TARGET_NEW."""
         page_num = 1
         while stats["added"] < TARGET_NEW:
             url = f"{BASE_URL}{category}?PAGEN_1={page_num}"
@@ -134,6 +143,7 @@ class ILeasingParser:
                 logger.warning(f"   ⏱ Таймаут на {url}, пропускаем")
                 return
 
+            # Ждём появления карточек
             try:
                 await page.wait_for_selector("a.l-catalog-item", timeout=10000)
             except PWTimeoutError:
@@ -157,14 +167,17 @@ class ILeasingParser:
 
                 stats["cards_seen"] += 1
 
+                # Фильтр по цене
                 if data["price_value"] is None or data["price_value"] < MIN_PRICE:
                     stats["skipped_price"] += 1
                     continue
 
+                # Дедупликация
                 if self.db.listing_exists(data["href"]):
                     stats["skipped_dup"] += 1
                     continue
 
+                # Сохраняем
                 self.db.add_listing(
                     external_id=data["external_id"],
                     url=data["href"],
@@ -187,26 +200,32 @@ class ILeasingParser:
             page_num += 1
 
     async def _extract_card(self, card) -> Optional[dict]:
+        """Извлекает данные из одной карточки каталога."""
         try:
             href = await card.get_attribute("href")
             if not href:
                 return None
             full_url = urljoin(BASE_URL, href)
 
+            # external_id из id="bx_..._43304_..."
             el_id = await card.get_attribute("id") or ""
             m = re.search(r"_(\d+)_", el_id)
             external_id = m.group(1) if m else href
 
+            # Название
             title_el = await card.query_selector(".l-catalog-item__name")
             title = (await title_el.inner_text()).strip() if title_el else ""
 
+            # Цена
             price_el = await card.query_selector(".l-catalog-item__price-value")
             price_text = (await price_el.inner_text()).strip() if price_el else ""
             price_value = parse_price(price_text)
 
+            # Лизинг
             leasing_el = await card.query_selector(".l-catalog-item__price-leasing")
             leasing_text = (await leasing_el.inner_text()).strip() if leasing_el else ""
 
+            # Характеристики
             props = {}
             prop_items = await card.query_selector_all(".l-catalog-item__props-item")
             for item in prop_items:
@@ -217,6 +236,7 @@ class ILeasingParser:
                     value = (await value_el.inner_text()).strip()
                     props[name] = value
 
+            # Фото
             img_el = await card.query_selector(".l-catalog-item__image img")
             image = ""
             if img_el:
@@ -240,14 +260,26 @@ class ILeasingParser:
 
 
 async def run_parser(db, headless: bool = True) -> dict:
+    """Точка входа для вызова из планировщика."""
     parser = ILeasingParser(db, headless=headless)
     return await parser.run()
 
 
+# Для ручного теста: python -m parser.parser
 if __name__ == "__main__":
     from parser.database import ParserDB
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    # Локально: HEADLESS=false python -m parser.parser (видно браузер)
+    # На сервере: по умолчанию headless=True
+    headless = os.environ.get("HEADLESS", "true").lower() != "false"
+    logger.info(f"🚀 Запуск парсера (headless={headless})")
+
     db = ParserDB("data/listings.db")
-    result = asyncio.run(run_parser(db, headless=False))
+    result = asyncio.run(run_parser(db, headless=headless))
     print("\n📊 Статистика:", result)
     print("📦 В БД:", db.stats())
