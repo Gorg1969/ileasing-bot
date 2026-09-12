@@ -2,7 +2,6 @@
 """
 SQLite-обёртка для парсера.
 Хранит только listings (спарсенные карточки).
-Таблица published живёт в bot/modules/database.py.
 """
 
 import sqlite3
@@ -42,6 +41,7 @@ class ParserDB:
                     drive TEXT,
                     seats TEXT,
                     image TEXT,
+                    images_path TEXT,
                     category TEXT,
                     parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     status TEXT DEFAULT 'pending'
@@ -53,7 +53,6 @@ class ParserDB:
             logger.info(f"✅ БД парсера инициализирована: {self.db_path}")
 
     def listing_exists(self, url: str) -> bool:
-        """Проверяет, есть ли карточка с таким URL."""
         conn = self._connect()
         try:
             row = conn.execute(
@@ -78,9 +77,9 @@ class ParserDB:
         drive: str = None,
         seats: str = None,
         image: str = None,
+        images_path: str = None,
         category: str = None,
     ) -> bool:
-        """Добавляет новую карточку. Возвращает True, если добавлена."""
         try:
             conn = self._connect()
             try:
@@ -88,19 +87,18 @@ class ParserDB:
                     INSERT INTO listings (
                         external_id, url, title, price, price_value, leasing,
                         engine, transmission, power, volume, drive, seats,
-                        image, category, status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                        image, images_path, category, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
                 """, (
                     external_id, url, title, price, price_value, leasing,
                     engine, transmission, power, volume, drive, seats,
-                    image, category,
+                    image, images_path, category,
                 ))
                 conn.commit()
                 return True
             finally:
                 conn.close()
         except sqlite3.IntegrityError:
-            # Уже есть — не ошибка
             return False
 
     def count_pending(self) -> int:
@@ -113,39 +111,10 @@ class ParserDB:
         finally:
             conn.close()
 
-    def get_pending(self, limit: int = 20) -> list:
-        """Возвращает список pending-карточек (для отладки)."""
-        conn = self._connect()
-        try:
-            rows = conn.execute("""
-                SELECT * FROM listings
-                WHERE status = 'pending'
-                ORDER BY parsed_at DESC
-                LIMIT ?
-            """, (limit,)).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
-
-    def mark_published(self, url: str) -> bool:
-        """Помечает карточку как опубликованную."""
-        conn = self._connect()
-        try:
-            conn.execute(
-                "UPDATE listings SET status = 'published' WHERE url = ?",
-                (url,)
-            )
-            conn.commit()
-            return True
-        finally:
-            conn.close()
-
     def stats(self) -> dict:
         conn = self._connect()
         try:
-            total = conn.execute(
-                "SELECT COUNT(*) as c FROM listings"
-            ).fetchone()["c"]
+            total = conn.execute("SELECT COUNT(*) as c FROM listings").fetchone()["c"]
             pending = conn.execute(
                 "SELECT COUNT(*) as c FROM listings WHERE status = 'pending'"
             ).fetchone()["c"]
