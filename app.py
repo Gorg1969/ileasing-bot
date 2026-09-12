@@ -1,4 +1,4 @@
-# bot/app.py
+# app.py
 """
 Главный файл бота-публикатора.
 Flask + веб-интерфейс + форма консультации + планировщик.
@@ -6,7 +6,8 @@ Flask + веб-интерфейс + форма консультации + пла
 Особенности:
 - ADMIN_USER_ID определяется автоматически: первый, кто напишет /start, становится админом.
 - ID сохраняется в data/admin_id.txt
-- Сбросить: /admin_reset (только текущий админ может сбросить)
+- Доступ к боту имеют только админ. Остальные видят "Доступ ограничен".
+- Сбросить админа: /admin_reset (только текущий админ)
 """
 
 from flask import Flask, request, jsonify, render_template_string
@@ -31,9 +32,15 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = os.environ.get("MAX_TOKEN") or os.environ.get("MAX_BOT_TOKEN") or os.environ.get("TOKEN") or os.environ.get("API_TOKEN")
+TOKEN = (
+    os.environ.get("BOT_TOKEN")
+    or os.environ.get("MAX_BOT_TOKEN")
+    or os.environ.get("MAX_TOKEN")
+    or os.environ.get("TOKEN")
+    or os.environ.get("API_TOKEN")
+)
 BASE_URL = "https://platform-api2.max.ru"
-DATA_DIR = "/app/data"
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "-1234567890")
 ADMIN_ID_FILE = os.path.join(DATA_DIR, "admin_id.txt")
 
@@ -66,6 +73,12 @@ def save_admin_id(user_id: int):
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения admin_id: {e}")
         return False
+
+
+def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь админом."""
+    admin_id = get_admin_id()
+    return admin_id is not None and admin_id == user_id
 
 
 # ========== API CLIENT ==========
@@ -206,11 +219,8 @@ fm = FileManager(DATA_DIR)
 publisher = Publisher(api, fm, db)
 report_gen = ReportGenerator(fm, db)
 
-# Инициализируем планировщик
 sched_module.init_scheduler(api, db, publisher, description_gen, CHANNEL_ID)
 scheduler = sched_module.start_scheduler()
-
-# Скачиваем свежую listings.db при старте
 sched_module.refresh_listings()
 
 
@@ -325,7 +335,6 @@ def index():
     return jsonify({
         "status": "running",
         "admin_configured": admin_id is not None,
-        "admin_id": admin_id,
     })
 
 
@@ -354,21 +363,13 @@ def submit_consultation():
         if not fio or not phone or not inn:
             return jsonify({'success': False, 'message': 'Заполните все поля'}), 400
 
-        # Сохраняем в БД
         consultation_id = db.add_consultation(fio, phone, inn)
-
-        # Получаем ID админа
         admin_id = get_admin_id()
 
         if admin_id is None:
-            logger.warning(f"⚠️ Admin ID не задан. Заявка #{consultation_id} сохранена, но не отправлена.")
-            # Всё равно возвращаем success, чтобы пользователь не паниковал
-            return jsonify({
-                'success': True,
-                'message': 'Заявка сохранена. Ожидайте звонка.'
-            })
+            logger.warning(f"⚠️ Admin ID не задан. Заявка #{consultation_id} сохранена.")
+            return jsonify({'success': True, 'message': 'Заявка сохранена.'})
 
-        # Отправляем админу в личку MAX
         text = (
             f"🔔 **Новая заявка на консультацию!**\n\n"
             f"👤 ФИО: {fio}\n"
@@ -418,59 +419,63 @@ def webhook():
             text = body.get('text', '').strip() if body.get('text') else ''
             message_id = body.get('mid')
 
-            logger.info(f"📨 chat_id={chat_id}, user_id={user_id}, text={text}")
+            logger.info(f"📨 user_id={user_id}, text={text}")
 
-            # === /start — регистрация админа ===
-            if text == '/start' and user_id:
-                current_admin = get_admin_id()
-                if current_admin is None:
-                    # Первый, кто написал /start — становится админом
-                    save_admin_id(user_id)
-                    api.send_message(
-                        user_id,
-                        "✅ **Вы зарегистрированы как администратор!**\n\n"
-                        "Теперь сюда будут приходить заявки с формы консультации.\n\n"
-                        "Команды:\n"
-                        "/start — это меню\n"
-                        "/admin_reset — сбросить админа\n"
-                        "/status — статус бота"
-                    )
-                else:
-                    api.send_message(
-                        user_id,
-                        "🏠 **Главное меню**\n\n"
-                        f"📝 Записаться на консультацию:\n"
-                        f"{request.host_url}consultation"
-                    )
+            # ============ ЗАЩИТА: игнорируем всех, кроме админа ============
+            current_admin = get_admin_id()
+
+            # Если админ ещё не задан — первый, кто написал /start, становится им
+            if current_admin is None and text == '/start' and user_id:
+                save_admin_id(user_id)
+                api.send_message(
+                    user_id,
+                    "✅ **Вы зарегистрированы как администратор!**\n\n"
+                    "Теперь сюда будут приходить заявки с формы консультации.\n\n"
+                    "Команды:\n"
+                    "/start — это меню\n"
+                    "/admin_reset — сбросить админа\n"
+                    "/status — статус бота"
+                )
                 return jsonify({"ok": True}), 200
 
-            # === /admin_reset — сброс админа ===
-            if text == '/admin_reset' and user_id:
-                current_admin = get_admin_id()
-                if current_admin == user_id:
-                    if os.path.exists(ADMIN_ID_FILE):
-                        os.remove(ADMIN_ID_FILE)
-                    api.send_message(
-                        user_id,
-                        "🗑️ **Admin ID сброшен.**\n\n"
-                        "Следующий, кто напишет /start, станет админом."
-                    )
-                else:
-                    api.send_message(user_id, "⛔ У вас нет прав на эту команду.")
+            # Все остальные — игнорируются
+            if not is_admin(user_id):
+                logger.info(f"⛔ Игнорирую не-админа {user_id}")
                 return jsonify({"ok": True}), 200
 
-            # === /status — статус бота ===
-            if text == '/status' and user_id:
-                admin_id = get_admin_id()
+            # ============ ТОЛЬКО ДЛЯ АДМИНА ============
+
+            if text == '/start':
+                api.send_message(
+                    user_id,
+                    "🏠 **Главное меню**\n\n"
+                    f"📝 Записаться на консультацию:\n"
+                    f"https://{request.host}/consultation"
+                )
+                return jsonify({"ok": True}), 200
+
+            if text == '/admin_reset':
+                if os.path.exists(ADMIN_ID_FILE):
+                    os.remove(ADMIN_ID_FILE)
+                api.send_message(
+                    user_id,
+                    "🗑️ **Admin ID сброшен.**\n\n"
+                    "Следующий, кто напишет /start, станет админом."
+                )
+                return jsonify({"ok": True}), 200
+
+            if text == '/status':
                 stats = db.stats()
                 api.send_message(
                     user_id,
                     f"📊 **Статус бота**\n\n"
-                    f"👤 Admin ID: `{admin_id}`\n"
                     f"📦 Опубликовано: {stats.get('published_total', 0)}\n"
                     f"📡 Канал: `{CHANNEL_ID}`"
                 )
                 return jsonify({"ok": True}), 200
+
+            # Неизвестная команда — молчим
+            return jsonify({"ok": True}), 200
 
         return jsonify({"ok": True}), 200
 
