@@ -1,22 +1,15 @@
 # app.py
-"""
-Главный файл бота-публикатора.
-Flask + веб-интерфейс + форма консультации + планировщик.
-
-Особенности:
-- ADMIN_USER_ID определяется автоматически: первый, кто напишет /start, становится админом.
-- ID сохраняется в data/admin_id.txt
-- Доступ к боту имеют только админ.
-- TEST_MODE=true — посты идут в личку админу (для отладки)
-- Страница /admin — ручное управление публикацией
-"""
-
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, send_file
 import requests
 import logging
 import os
+import shutil
 import urllib3
-
+import json
+import threading
+import time
+import base64
+from werkzeug.exceptions import ClientDisconnected
 from modules.database import Database
 from modules.file_manager import FileManager
 from modules.publisher import Publisher
@@ -28,7 +21,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev_secret_key")
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -52,7 +45,6 @@ if not TOKEN:
 # ========== ОПРЕДЕЛЕНИЕ АДМИНА ==========
 
 def get_admin_id():
-    """Читает ID админа из файла."""
     try:
         if os.path.exists(ADMIN_ID_FILE):
             with open(ADMIN_ID_FILE, "r") as f:
@@ -64,7 +56,6 @@ def get_admin_id():
 
 
 def save_admin_id(user_id: int):
-    """Сохраняет ID админа в файл."""
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(ADMIN_ID_FILE, "w") as f:
@@ -77,7 +68,6 @@ def save_admin_id(user_id: int):
 
 
 def is_admin(user_id: int) -> bool:
-    """Проверяет, является ли пользователь админом."""
     admin_id = get_admin_id()
     return admin_id is not None and admin_id == user_id
 
@@ -104,6 +94,8 @@ class APIClient:
                 timeout=30,
                 verify=False
             )
+            if response.status_code != 200:
+                logger.error(f"❌ send_message: {response.status_code} - {response.text[:200]}")
             return response.status_code == 200
         except Exception as e:
             logger.error(f"❌ Ошибка отправки: {e}")
@@ -123,7 +115,7 @@ class APIClient:
             )
             if response.status_code == 200:
                 return True
-            logger.error(f"❌ Ошибка: {response.status_code} - {response.text}")
+            logger.error(f"❌ send_message_to_chat: {response.status_code} - {response.text[:200]}")
             return False
         except Exception as e:
             logger.error(f"❌ Ошибка: {e}")
@@ -140,6 +132,7 @@ class APIClient:
                 "format": "markdown",
                 "attachments": attachments
             }
+            logger.info(f"📤 send_message_with_attachments: chat_id={chat_id}, tokens={tokens}")
             response = requests.post(
                 f"{self.base_url}/messages",
                 headers={"Authorization": self.token, "Content-Type": "application/json"},
@@ -147,9 +140,10 @@ class APIClient:
                 timeout=60,
                 verify=False
             )
+            logger.info(f"📤 Ответ: HTTP {response.status_code}, {response.text[:300]}")
             if response.status_code == 200:
                 return True
-            logger.error(f"❌ Ошибка: {response.status_code} - {response.text}")
+            logger.error(f"❌ Ошибка: {response.status_code} - {response.text[:300]}")
             return False
         except Exception as e:
             logger.error(f"❌ Ошибка: {e}")
@@ -157,8 +151,12 @@ class APIClient:
 
     def upload_file(self, image_bytes, filename='image.jpg'):
         if not self.token:
+            logger.error("❌ Нет токена для загрузки")
             return None
+
         try:
+            # ШАГ 1: Получаем URL для загрузки
+            logger.info(f"📤 ШАГ 1: Запрос upload URL ({len(image_bytes)} байт)")
             response = requests.post(
                 f"{self.base_url}/uploads",
                 headers={"Authorization": self.token},
@@ -166,28 +164,74 @@ class APIClient:
                 timeout=30,
                 verify=False
             )
+            logger.info(f"📤 ШАГ 1: HTTP {response.status_code}, ответ: {response.text[:300]}")
+
             if response.status_code != 200:
+                logger.error(f"❌ Ошибка получения URL: {response.status_code} - {response.text[:200]}")
                 return None
-            upload_data = response.json()
+
+            try:
+                upload_data = response.json()
+            except ValueError:
+                logger.error(f"❌ Невалидный JSON: {response.text[:200]}")
+                return None
+
             upload_url = upload_data.get('url')
+            logger.info(f"📤 Получен upload_url: {upload_url}")
+
             if not upload_url:
+                logger.error(f"❌ Не получен URL: {upload_data}")
                 return None
 
+            # ШАГ 2: Загружаем файл
             files = {'data': (filename, image_bytes, 'image/jpeg')}
-            upload_response = requests.post(upload_url, files=files, timeout=60, verify=False)
+            logger.info(f"📤 ШАГ 2: POST на {upload_url}")
+
+            upload_response = requests.post(
+                upload_url,
+                files=files,
+                timeout=60,
+                verify=False
+            )
+            logger.info(f"📤 ШАГ 2: HTTP {upload_response.status_code}, ответ: {upload_response.text[:500]}")
+
             if upload_response.status_code != 200:
+                logger.error(f"❌ Ошибка загрузки: {upload_response.status_code} - {upload_response.text[:200]}")
                 return None
 
-            result = upload_response.json()
-            if 'photos' in result and isinstance(result['photos'], dict):
-                for photo_data in result['photos'].values():
+            try:
+                upload_result = upload_response.json()
+            except ValueError:
+                logger.error(f"❌ Невалидный JSON в ответе: {upload_response.text[:200]}")
+                return None
+
+            logger.info(f"📤 ШАГ 2: JSON ответа: {upload_result}")
+
+            # ШАГ 3: Извлекаем токен
+            token = None
+            if 'photos' in upload_result and isinstance(upload_result['photos'], dict):
+                for photo_data in upload_result['photos'].values():
                     if isinstance(photo_data, dict) and 'token' in photo_data:
-                        return photo_data['token']
-            if 'token' in result:
-                return result['token']
-            return None
+                        token = photo_data['token']
+                        break
+
+            if not token and 'token' in upload_result:
+                token = upload_result['token']
+
+            if not token and 'data' in upload_result and 'token' in upload_result['data']:
+                token = upload_result['data']['token']
+
+            if not token:
+                logger.error(f"❌ Токен не найден в ответе: {upload_result}")
+                return None
+
+            logger.info(f"✅ Файл загружен, токен: {token[:30]}...")
+            return token
+
         except Exception as e:
-            logger.error(f"❌ Ошибка загрузки файла: {e}")
+            logger.error(f"❌ Исключение при загрузке: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def delete_message(self, message_id):
@@ -255,7 +299,6 @@ CONSULTATION_PAGE = """
     <div class="container">
         <h1>Запись на консультацию</h1>
         <p class="subtitle">Заполните форму, и наш эксперт свяжется с вами</p>
-
         <form id="consultForm">
             <div class="field">
                 <label for="fio">ФИО *</label>
@@ -271,40 +314,30 @@ CONSULTATION_PAGE = """
             </div>
             <button type="submit" class="btn" id="submitBtn">ОТПРАВИТЬ</button>
         </form>
-
         <div id="message" class="message"></div>
-
-        <div class="note">
-            После отправки с вами свяжется эксперт по лизингу.
-        </div>
+        <div class="note">После отправки с вами свяжется эксперт по лизингу.</div>
     </div>
-
     <script>
         const form = document.getElementById('consultForm');
         const messageDiv = document.getElementById('message');
         const submitBtn = document.getElementById('submitBtn');
-
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
             submitBtn.disabled = true;
             submitBtn.textContent = 'Отправка...';
             messageDiv.style.display = 'none';
-
             const data = {
                 fio: document.getElementById('fio').value.trim(),
                 phone: document.getElementById('phone').value.trim(),
                 inn: document.getElementById('inn').value.trim()
             };
-
             try {
                 const response = await fetch('/submit_consultation', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(data)
                 });
-
                 const result = await response.json();
-
                 if (result.success) {
                     messageDiv.className = 'message success';
                     messageDiv.textContent = '✅ Спасибо, ваша заявка отправлена, ожидайте звонка специалиста!';
@@ -367,12 +400,10 @@ ADMIN_PAGE = """
             <h1>🎛️ Админ-панель бота</h1>
             <div id="modeInfo"></div>
         </div>
-
         <div class="card">
             <h2>📊 Статистика</h2>
             <div id="stats">Загрузка...</div>
         </div>
-
         <div class="card">
             <h2>🚀 Ручное управление</h2>
             <div class="warning">
@@ -385,42 +416,34 @@ ADMIN_PAGE = """
             <div id="log" class="log" style="display:none;"></div>
         </div>
     </div>
-
     <script>
         const logDiv = document.getElementById('log');
-
         function addLog(text) {
             logDiv.style.display = 'block';
             logDiv.textContent += new Date().toLocaleTimeString() + ' → ' + text + '\\n';
             logDiv.scrollTop = logDiv.scrollHeight;
         }
-
         async function loadStats() {
             try {
                 const r = await fetch('/admin_stats');
                 const d = await r.json();
-
                 const modeBadge = d.test_mode
                     ? '<span class="mode-badge mode-test">🧪 ТЕСТОВЫЙ РЕЖИМ</span>'
                     : '<span class="mode-badge mode-live">🔴 БОЕВОЙ РЕЖИМ</span>';
-
                 document.getElementById('modeInfo').innerHTML =
-                    '<div style="font-size:14px;color:#666;">' +
-                    'Режим работы: ' + modeBadge +
-                    (d.test_mode ? '<br><small>Посты идут в личку админу, канал не затрагивается.</small>'
-                                 : '<br><small>Посты публикуются в канал: <code>' + d.channel_id + '</code></small>') +
+                    '<div style="font-size:14px;color:#666;">Режим: ' + modeBadge +
+                    (d.test_mode ? '<br><small>Посты идут в личку админу.</small>'
+                                 : '<br><small>Канал: <code>' + d.channel_id + '</code></small>') +
                     '</div>';
-
                 document.getElementById('stats').innerHTML =
                     '<div class="status-row"><span class="status-label">📦 Опубликовано</span><span class="status-value">' + d.published_total + '</span></div>' +
-                    '<div class="status-row"><span class="status-label">⏳ В очереди (pending)</span><span class="status-value">' + d.pending + '</span></div>' +
-                    '<div class="status-row"><span class="status-label">📊 Всего в listings.db</span><span class="status-value">' + d.listings_total + '</span></div>' +
-                    '<div class="status-row"><span class="status-label">👤 Админ ID</span><span class="status-value">' + (d.admin_id || '—') + '</span></div>';
+                    '<div class="status-row"><span class="status-label">⏳ В очереди</span><span class="status-value">' + d.pending + '</span></div>' +
+                    '<div class="status-row"><span class="status-label">📊 Всего</span><span class="status-value">' + d.listings_total + '</span></div>' +
+                    '<div class="status-row"><span class="status-label">👤 Админ</span><span class="status-value">' + (d.admin_id || '—') + '</span></div>';
             } catch (e) {
-                document.getElementById('stats').textContent = 'Ошибка загрузки: ' + e.message;
+                document.getElementById('stats').textContent = 'Ошибка: ' + e.message;
             }
         }
-
         async function publishNow() {
             addLog('🚀 Запуск публикации...');
             try {
@@ -428,35 +451,26 @@ ADMIN_PAGE = """
                 const d = await r.json();
                 addLog(d.success ? '✅ ' + d.message : '❌ ' + d.message);
                 loadStats();
-            } catch (e) {
-                addLog('❌ Ошибка: ' + e.message);
-            }
+            } catch (e) { addLog('❌ ' + e.message); }
         }
-
         async function refreshListings() {
-            addLog('🔄 Обновление listings.db...');
+            addLog('🔄 Обновление...');
             try {
                 const r = await fetch('/refresh_listings', {method: 'POST'});
                 const d = await r.json();
-                addLog(d.success ? '✅ listings.db обновлена' : '❌ Не удалось обновить');
+                addLog(d.success ? '✅ Обновлено' : '❌ Ошибка');
                 loadStats();
-            } catch (e) {
-                addLog('❌ Ошибка: ' + e.message);
-            }
+            } catch (e) { addLog('❌ ' + e.message); }
         }
-
         async function cleanupOld() {
-            addLog('🗑️ Запуск очистки...');
+            addLog('🗑️ Очистка...');
             try {
                 const r = await fetch('/manual_cleanup', {method: 'POST'});
                 const d = await r.json();
                 addLog(d.success ? '✅ ' + d.message : '❌ ' + d.message);
                 loadStats();
-            } catch (e) {
-                addLog('❌ Ошибка: ' + e.message);
-            }
+            } catch (e) { addLog('❌ ' + e.message); }
         }
-
         loadStats();
         setInterval(loadStats, 30000);
     </script>
@@ -495,12 +509,10 @@ def admin_page():
 
 @app.route('/admin_stats')
 def admin_stats():
-    """Статистика для админ-панели."""
     try:
         published_stats = db.stats()
         admin_id = get_admin_id()
 
-        # Статистика по listings.db
         listings_total = 0
         pending = 0
         try:
@@ -671,7 +683,6 @@ def setup_webhook():
 
 @app.route('/manual_publish', methods=['POST'])
 def manual_publish():
-    """Ручной запуск публикации."""
     try:
         sched_module.publish_random_post(force=True)
         return jsonify({'success': True, 'message': 'Публикация запущена'})
