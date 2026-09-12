@@ -1,0 +1,12 @@
+.git
+.github
+parser
+data/images
+data/listings.db
+__pycache__
+*.pyc
+*.pyo
+*.log
+.venv
+venv
+.env.local
