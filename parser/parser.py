@@ -6,12 +6,14 @@
 1. Случайно выбирает подкатегорию из ALLOWED_CATEGORIES.
 2. Обходит страницы каталога (?PAGEN_1=N), собирает карточки.
 3. Фильтрует: цена >= MIN_PRICE, href ещё нет в БД.
-4. Новые добавляет в listings со статусом pending.
-5. Цель — 20 новых карточек за запуск. Лимит — 5 категорий.
+4. Для новых карточек: заходит в карточку, скачивает ВСЕ фото через браузер.
+5. Сохраняет: listings.db + data/images/{external_id}/*.jpg
+6. Цель — 20 новых карточек за запуск. Лимит — 5 категорий.
 """
 
 import os
 import re
+import json
 import random
 import logging
 import asyncio
@@ -26,9 +28,9 @@ BASE_URL = "https://www.ileasing.ru"
 MIN_PRICE = 2_200_000
 TARGET_NEW = 20
 MAX_CATEGORIES = 5
+IMAGES_DIR = "data/images"
 
 ALLOWED_CATEGORIES = [
-    # Легковой транспорт
     "/catalog/car/sedan/",
     "/catalog/car/universal/",
     "/catalog/car/hetchbek/",
@@ -37,20 +39,16 @@ ALLOWED_CATEGORIES = [
     "/catalog/car/kupe/",
     "/catalog/car/liftbek/",
     "/catalog/car/miniven/",
-    # Легкий коммерческий транспорт
     "/catalog/commercial-vehicles/furgon/",
     "/catalog/commercial-vehicles/bortovye/",
     "/catalog/commercial-vehicles/pikap/",
     "/catalog/commercial-vehicles/shassi/",
-    # Грузовая техника
     "/catalog/freight-transport/gruzovye-avtomobili/",
     "/catalog/freight-transport/pritsepy-i-polupritsepy/",
     "/catalog/freight-transport/sedelnye-tyagachi/",
-    # Автобусы
     "/catalog/bus/avtobusy/",
     "/catalog/bus/mikroavtobusy/",
     "/catalog/bus/vakhtovye-avtobusy/",
-    # Сельхозтехника
     "/catalog/agricultural-machinery/kombayny/",
     "/catalog/agricultural-machinery/traktory/",
     "/catalog/agricultural-machinery/borony/",
@@ -60,7 +58,6 @@ ALLOWED_CATEGORIES = [
     "/catalog/agricultural-machinery/polivalnye-mashiny/",
     "/catalog/agricultural-machinery/posevnoe-oborudovanie/",
     "/catalog/agricultural-machinery/pr-selkhoztekhnika/",
-    # Спецтехника (без горнодобывающей)
     "/catalog/special-machinery/dorozhno-stroitelnaya-tekhnika/",
     "/catalog/special-machinery/kommunalnaya-tekhnika/",
     "/catalog/special-machinery/spetsializirovannaya-tekhnika/",
@@ -70,7 +67,6 @@ ALLOWED_CATEGORIES = [
 
 
 def parse_price(text: str) -> Optional[int]:
-    """'от 3 243 427 ₽' -> 3243427. Возвращает None, если не распарсить."""
     if not text:
         return None
     digits = re.sub(r"[^\d]", "", text)
@@ -83,7 +79,6 @@ class ILeasingParser:
         self.headless = headless
 
     async def run(self) -> dict:
-        """Главный метод. Возвращает статистику."""
         stats = {
             "categories_tried": 0,
             "pages_visited": 0,
@@ -91,6 +86,7 @@ class ILeasingParser:
             "skipped_price": 0,
             "skipped_dup": 0,
             "added": 0,
+            "images_downloaded": 0,
         }
 
         async with async_playwright() as pw:
@@ -120,7 +116,7 @@ class ILeasingParser:
                 logger.info(f"🎲 Категория {stats['categories_tried']}/{MAX_CATEGORIES}: {category}")
 
                 try:
-                    await self._process_category(page, category, stats)
+                    await self._process_category(context, page, category, stats)
                 except Exception as e:
                     logger.error(f"❌ Ошибка в категории {category}: {e}")
                     continue
@@ -130,8 +126,7 @@ class ILeasingParser:
         logger.info(f"📊 Итог парсинга: {stats}")
         return stats
 
-    async def _process_category(self, page: Page, category: str, stats: dict):
-        """Обходит страницы одной категории, пока не наберём TARGET_NEW."""
+    async def _process_category(self, context, page: Page, category: str, stats: dict):
         page_num = 1
         while stats["added"] < TARGET_NEW:
             url = f"{BASE_URL}{category}?PAGEN_1={page_num}"
@@ -143,16 +138,14 @@ class ILeasingParser:
                 logger.warning(f"   ⏱ Таймаут на {url}, пропускаем")
                 return
 
-            # Ждём появления карточек
             try:
                 await page.wait_for_selector("a.l-catalog-item", timeout=10000)
             except PWTimeoutError:
-                logger.info(f"   ⛔ Нет карточек на странице {page_num}, конец категории")
+                logger.info(f"   ⛔ Нет карточек на странице {page_num}")
                 return
 
             cards = await page.query_selector_all("a.l-catalog-item")
             if not cards:
-                logger.info(f"   ⛔ Пустая страница {page_num}")
                 return
 
             stats["pages_visited"] += 1
@@ -167,17 +160,26 @@ class ILeasingParser:
 
                 stats["cards_seen"] += 1
 
-                # Фильтр по цене
                 if data["price_value"] is None or data["price_value"] < MIN_PRICE:
                     stats["skipped_price"] += 1
                     continue
 
-                # Дедупликация
                 if self.db.listing_exists(data["href"]):
                     stats["skipped_dup"] += 1
                     continue
 
-                # Сохраняем
+                # Скачиваем ВСЕ фото из карточки товара
+                images_count = await self._download_images_for_listing(
+                    context, data["external_id"], data["href"]
+                )
+                stats["images_downloaded"] += images_count
+
+                # Формируем JSON-путь к фото
+                images_path = json.dumps([
+                    f"data/images/{data['external_id']}/{i+1}.jpg"
+                    for i in range(images_count)
+                ])
+
                 self.db.add_listing(
                     external_id=data["external_id"],
                     url=data["href"],
@@ -192,40 +194,106 @@ class ILeasingParser:
                     drive=data["props"].get("Привод"),
                     seats=data["props"].get("Количество мест"),
                     image=data["image"],
+                    images_path=images_path,
                     category=category,
                 )
                 stats["added"] += 1
-                logger.info(f"   ✅ [{stats['added']}/{TARGET_NEW}] {data['title']} — {data['price_text']}")
+                logger.info(f"   ✅ [{stats['added']}/{TARGET_NEW}] {data['title']} — {data['price_text']} ({images_count} фото)")
 
             page_num += 1
 
+    async def _download_images_for_listing(self, context, external_id: str, card_url: str) -> int:
+        """
+        Открывает карточку товара, собирает ВСЕ фото из галереи,
+        скачивает их через контекст браузера (обход hotlink protection).
+        Возвращает количество успешно скачанных фото.
+        """
+        save_dir = os.path.join(IMAGES_DIR, external_id)
+        os.makedirs(save_dir, exist_ok=True)
+
+        page = await context.new_page()
+        try:
+            logger.info(f"   📸 Открываю карточку для фото: {card_url}")
+            await page.goto(card_url, wait_until="domcontentloaded", timeout=30000)
+
+            # Ждём загрузки галереи
+            await page.wait_for_timeout(2000)
+
+            # Собираем URL фото из галереи.
+            # Селектор может отличаться — нужно проверить на реальной карточке.
+            # Пробуем несколько вариантов:
+            photo_urls = await page.evaluate("""
+                () => {
+                    const urls = new Set();
+                    // Вариант 1: галерея с картинками в контейнере
+                    document.querySelectorAll('.l-gallery img, .gallery img, [class*="gallery"] img, [class*="slider"] img').forEach(img => {
+                        if (img.src && !img.src.includes('data:image')) urls.add(img.src);
+                    });
+                    // Вариант 2: любые крупные картинки на странице
+                    if (urls.size === 0) {
+                        document.querySelectorAll('img').forEach(img => {
+                            if (img.src && (img.naturalWidth > 300 || (img.width > 300)) && !img.src.includes('data:image')) {
+                                urls.add(img.src);
+                            }
+                        });
+                    }
+                    return Array.from(urls);
+                }
+            """)
+
+            logger.info(f"   📸 Найдено {len(photo_urls)} фото в карточке")
+
+            # Скачиваем каждое фото через браузер (в контексте сессии)
+            downloaded = 0
+            for i, url in enumerate(photo_urls[:10]):  # максимум 10 фото
+                try:
+                    full_url = urljoin(BASE_URL, url)
+                    response = await context.request.get(full_url, timeout=15000)
+                    if response.status == 200:
+                        content = await response.body()
+                        # Проверяем сигнатуру
+                        if content[:3] == b'\xff\xd8\xff' or content[:8] == b'\x89PNG\r\n\x1a\n':
+                            filepath = os.path.join(save_dir, f"{i+1}.jpg")
+                            with open(filepath, "wb") as f:
+                                f.write(content)
+                            downloaded += 1
+                            logger.info(f"   ✅ Фото {i+1}: {len(content)} байт")
+                        else:
+                            logger.warning(f"   ⚠️ Фото {i+1} не является картинкой (сигнатура: {content[:8].hex()})")
+                    else:
+                        logger.warning(f"   ⚠️ Фото {i+1}: HTTP {response.status}")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Ошибка скачивания фото {i+1}: {e}")
+
+            return downloaded
+
+        except Exception as e:
+            logger.error(f"   ❌ Ошибка в карточке {card_url}: {e}")
+            return 0
+        finally:
+            await page.close()
+
     async def _extract_card(self, card) -> Optional[dict]:
-        """Извлекает данные из одной карточки каталога."""
         try:
             href = await card.get_attribute("href")
             if not href:
                 return None
             full_url = urljoin(BASE_URL, href)
 
-            # external_id из id="bx_..._43304_..."
             el_id = await card.get_attribute("id") or ""
             m = re.search(r"_(\d+)_", el_id)
             external_id = m.group(1) if m else href
 
-            # Название
             title_el = await card.query_selector(".l-catalog-item__name")
             title = (await title_el.inner_text()).strip() if title_el else ""
 
-            # Цена
             price_el = await card.query_selector(".l-catalog-item__price-value")
             price_text = (await price_el.inner_text()).strip() if price_el else ""
             price_value = parse_price(price_text)
 
-            # Лизинг
             leasing_el = await card.query_selector(".l-catalog-item__price-leasing")
             leasing_text = (await leasing_el.inner_text()).strip() if leasing_el else ""
 
-            # Характеристики
             props = {}
             prop_items = await card.query_selector_all(".l-catalog-item__props-item")
             for item in prop_items:
@@ -236,7 +304,6 @@ class ILeasingParser:
                     value = (await value_el.inner_text()).strip()
                     props[name] = value
 
-            # Фото
             img_el = await card.query_selector(".l-catalog-item__image img")
             image = ""
             if img_el:
@@ -260,25 +327,15 @@ class ILeasingParser:
 
 
 async def run_parser(db, headless: bool = True) -> dict:
-    """Точка входа для вызова из планировщика."""
     parser = ILeasingParser(db, headless=headless)
     return await parser.run()
 
 
-# Для ручного теста: python -m parser.parser
 if __name__ == "__main__":
     from parser.database import ParserDB
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-
-    # Локально: HEADLESS=false python -m parser.parser (видно браузер)
-    # На сервере: по умолчанию headless=True
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     headless = os.environ.get("HEADLESS", "true").lower() != "false"
     logger.info(f"🚀 Запуск парсера (headless={headless})")
-
     db = ParserDB("data/listings.db")
     result = asyncio.run(run_parser(db, headless=headless))
     print("\n📊 Статистика:", result)
