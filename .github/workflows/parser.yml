@@ -2,20 +2,23 @@ name: Parse ileasing.ru
 
 on:
   schedule:
-    # Раз в сутки в 02:00 UTC = 05:00 МСК
     - cron: '0 2 * * *'
-  workflow_dispatch:  # Ручной запуск через кнопку
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   parse:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -34,13 +37,14 @@ jobs:
         run: |
           python -m parser.parser
 
-      - name: Commit listings.db to state branch
+      - name: Commit listings.db and images to state branch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -B state
           git add -f data/listings.db
-          git commit -m "chore: update listings.db $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "no changes"
+          git add -f data/images/ || echo "no images"
+          git commit -m "chore: update listings.db and images $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "no changes"
           git push -f origin state
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
