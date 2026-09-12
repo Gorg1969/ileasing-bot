@@ -1,0 +1,46 @@
+name: Parse ileasing.ru
+
+on:
+  schedule:
+    # Раз в сутки в 02:00 UTC = 05:00 МСК
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # Ручной запуск через кнопку
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: |
+          playwright install chromium --with-deps
+
+      - name: Run parser
+        run: |
+          python -m parser.parser
+
+      - name: Commit listings.db to state branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B state
+          git add -f data/listings.db
+          git commit -m "chore: update listings.db $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "no changes"
+          git push -f origin state
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
