@@ -1,4 +1,4 @@
-# Dockerfile — для BotHost (бот-публикатор)
+# Dockerfile — для BotHost (бот-публикатор) v-2.0
 FROM python:3.11-slim
 
 WORKDIR /app
