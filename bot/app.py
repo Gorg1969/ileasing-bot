@@ -2,9 +2,14 @@
 """
 Главный файл бота-публикатора.
 Flask + веб-интерфейс + форма консультации + планировщик.
+
+Особенности:
+- ADMIN_USER_ID определяется автоматически: первый, кто напишет /start, становится админом.
+- ID сохраняется в data/admin_id.txt
+- Сбросить: /admin_reset (только текущий админ может сбросить)
 """
 
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for
+from flask import Flask, request, jsonify, render_template_string
 import requests
 import logging
 import os
@@ -29,11 +34,38 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("MAX_TOKEN") or os.environ.get("MAX_BOT_TOKEN") or os.environ.get("TOKEN")
 BASE_URL = "https://platform-api2.max.ru"
 DATA_DIR = "/app/data"
-ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "151296248"))
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "-1234567890")  # ID канала MAX
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "-1234567890")
+ADMIN_ID_FILE = os.path.join(DATA_DIR, "admin_id.txt")
 
 if not TOKEN:
     logger.error("❌ ТОКЕН НЕ НАЙДЕН!")
+
+
+# ========== ОПРЕДЕЛЕНИЕ АДМИНА ==========
+
+def get_admin_id():
+    """Читает ID админа из файла. Возвращает None, если не задан."""
+    try:
+        if os.path.exists(ADMIN_ID_FILE):
+            with open(ADMIN_ID_FILE, "r") as f:
+                value = f.read().strip()
+                return int(value) if value else None
+    except Exception as e:
+        logger.error(f"❌ Ошибка чтения admin_id: {e}")
+    return None
+
+
+def save_admin_id(user_id: int):
+    """Сохраняет ID админа в файл."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(ADMIN_ID_FILE, "w") as f:
+            f.write(str(user_id))
+        logger.info(f"✅ Admin ID сохранён: {user_id}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения admin_id: {e}")
+        return False
 
 
 # ========== API CLIENT ==========
@@ -289,7 +321,12 @@ CONSULTATION_PAGE = """
 
 @app.route('/')
 def index():
-    return "🤖 MAX Bot is running!"
+    admin_id = get_admin_id()
+    return jsonify({
+        "status": "running",
+        "admin_configured": admin_id is not None,
+        "admin_id": admin_id,
+    })
 
 
 @app.route('/health')
@@ -320,6 +357,17 @@ def submit_consultation():
         # Сохраняем в БД
         consultation_id = db.add_consultation(fio, phone, inn)
 
+        # Получаем ID админа
+        admin_id = get_admin_id()
+
+        if admin_id is None:
+            logger.warning(f"⚠️ Admin ID не задан. Заявка #{consultation_id} сохранена, но не отправлена.")
+            # Всё равно возвращаем success, чтобы пользователь не паниковал
+            return jsonify({
+                'success': True,
+                'message': 'Заявка сохранена. Ожидайте звонка.'
+            })
+
         # Отправляем админу в личку MAX
         text = (
             f"🔔 **Новая заявка на консультацию!**\n\n"
@@ -328,11 +376,11 @@ def submit_consultation():
             f"🏢 ИНН: {inn}\n\n"
             f"🕐 Заявка #{consultation_id}"
         )
-        sent = api.send_message(ADMIN_USER_ID, text)
+        sent = api.send_message(admin_id, text)
 
         if sent:
             db.mark_consultation_sent(consultation_id)
-            logger.info(f"✅ Заявка #{consultation_id} отправлена админу")
+            logger.info(f"✅ Заявка #{consultation_id} отправлена админу {admin_id}")
         else:
             logger.error(f"❌ Не удалось отправить заявку #{consultation_id}")
 
@@ -351,7 +399,7 @@ def submit_consultation():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Обрабатывает события от MAX (создание сообщений)."""
+    """Обрабатывает события от MAX."""
     try:
         data = request.get_json()
         if not data:
@@ -367,23 +415,69 @@ def webhook():
 
             chat_id = recipient.get('chat_id')
             user_id = sender.get('user_id')
-            text = body.get('text', '')
+            text = body.get('text', '').strip() if body.get('text') else ''
             message_id = body.get('mid')
 
             logger.info(f"📨 chat_id={chat_id}, user_id={user_id}, text={text}")
 
-            if text and text.strip() == '/start' and user_id:
+            # === /start — регистрация админа ===
+            if text == '/start' and user_id:
+                current_admin = get_admin_id()
+                if current_admin is None:
+                    # Первый, кто написал /start — становится админом
+                    save_admin_id(user_id)
+                    api.send_message(
+                        user_id,
+                        "✅ **Вы зарегистрированы как администратор!**\n\n"
+                        "Теперь сюда будут приходить заявки с формы консультации.\n\n"
+                        "Команды:\n"
+                        "/start — это меню\n"
+                        "/admin_reset — сбросить админа\n"
+                        "/status — статус бота"
+                    )
+                else:
+                    api.send_message(
+                        user_id,
+                        "🏠 **Главное меню**\n\n"
+                        f"📝 Записаться на консультацию:\n"
+                        f"{request.host_url}consultation"
+                    )
+                return jsonify({"ok": True}), 200
+
+            # === /admin_reset — сброс админа ===
+            if text == '/admin_reset' and user_id:
+                current_admin = get_admin_id()
+                if current_admin == user_id:
+                    if os.path.exists(ADMIN_ID_FILE):
+                        os.remove(ADMIN_ID_FILE)
+                    api.send_message(
+                        user_id,
+                        "🗑️ **Admin ID сброшен.**\n\n"
+                        "Следующий, кто напишет /start, станет админом."
+                    )
+                else:
+                    api.send_message(user_id, "⛔ У вас нет прав на эту команду.")
+                return jsonify({"ok": True}), 200
+
+            # === /status — статус бота ===
+            if text == '/status' and user_id:
+                admin_id = get_admin_id()
+                stats = db.stats()
                 api.send_message(
                     user_id,
-                    "🏠 **Главное меню**\n\n"
-                    f"📝 Записаться на консультацию:\n"
-                    f"https://maxbot.bothost.tech/consultation"
+                    f"📊 **Статус бота**\n\n"
+                    f"👤 Admin ID: `{admin_id}`\n"
+                    f"📦 Опубликовано: {stats.get('published_total', 0)}\n"
+                    f"📡 Канал: `{CHANNEL_ID}`"
                 )
+                return jsonify({"ok": True}), 200
 
         return jsonify({"ok": True}), 200
 
     except Exception as e:
         logger.error(f"❌ Ошибка в вебхуке: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"ok": False}), 500
 
 
@@ -394,7 +488,7 @@ def setup_webhook():
     if not token:
         return "❌ Токен не найден", 400
 
-    webhook_url = "https://maxbot.bothost.tech/webhook"
+    webhook_url = f"{request.host_url}webhook".replace("http://", "https://")
     headers = {"Authorization": token, "Content-Type": "application/json"}
 
     try:
@@ -414,21 +508,6 @@ def setup_webhook():
         return f"❌ Ошибка: {r.status_code} - {r.text}"
     except Exception as e:
         return f"❌ Ошибка: {e}"
-
-
-@app.route('/status')
-def status():
-    """Общая статистика бота."""
-    try:
-        published_stats = db.stats()
-        pending_count = sched_module.get_random_pending_listing()
-        return jsonify({
-            'status': 'running',
-            'published': published_stats,
-            'has_pending': pending_count is not None,
-        })
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 @app.route('/manual_publish', methods=['POST'])
@@ -465,4 +544,11 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
     if TOKEN:
         logger.info(f"✅ Токен найден (первые 10): {TOKEN[:10]}...")
+
+    admin_id = get_admin_id()
+    if admin_id:
+        logger.info(f"✅ Admin ID: {admin_id}")
+    else:
+        logger.info("ℹ️ Admin ID не задан. Напишите боту /start, чтобы зарегистрироваться как админ.")
+
     app.run(host='0.0.0.0', port=port, threaded=True)
