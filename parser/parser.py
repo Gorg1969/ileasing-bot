@@ -29,6 +29,7 @@ MIN_PRICE = 2_200_000
 TARGET_NEW = 20
 MAX_CATEGORIES = 5
 IMAGES_DIR = "data/images"
+MAX_IMAGES = 10
 
 ALLOWED_CATEGORIES = [
     "/catalog/car/sedan/",
@@ -174,7 +175,6 @@ class ILeasingParser:
                 )
                 stats["images_downloaded"] += images_count
 
-                # Формируем JSON-путь к фото
                 images_path = json.dumps([
                     f"data/images/{data['external_id']}/{i+1}.jpg"
                     for i in range(images_count)
@@ -204,8 +204,8 @@ class ILeasingParser:
 
     async def _download_images_for_listing(self, context, external_id: str, card_url: str) -> int:
         """
-        Открывает карточку товара, собирает ВСЕ фото из галереи,
-        скачивает их через контекст браузера (обход hotlink protection).
+        Открывает карточку товара, собирает все фото из галереи
+        (a.l-catalog-card__gallery-item), скачивает их через контекст браузера.
         Возвращает количество успешно скачанных фото.
         """
         save_dir = os.path.join(IMAGES_DIR, external_id)
@@ -213,39 +213,37 @@ class ILeasingParser:
 
         page = await context.new_page()
         try:
-            logger.info(f"   📸 Открываю карточку для фото: {card_url}")
+            logger.info(f"   📸 Открываю карточку: {card_url}")
             await page.goto(card_url, wait_until="domcontentloaded", timeout=30000)
 
-            # Ждём загрузки галереи
+            # Ждём появления галереи
+            try:
+                await page.wait_for_selector("a.l-catalog-card__gallery-item", timeout=10000)
+            except PWTimeoutError:
+                logger.warning(f"   ⚠️ Галерея не найдена в карточке")
+                return 0
+
+            # Прокручиваем страницу вниз — чтобы lazy-load подгрузил все фото
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2000)
 
-            # Собираем URL фото из галереи.
-            # Селектор может отличаться — нужно проверить на реальной карточке.
-            # Пробуем несколько вариантов:
+            # Собираем URL фото — точный селектор
             photo_urls = await page.evaluate("""
                 () => {
                     const urls = new Set();
-                    // Вариант 1: галерея с картинками в контейнере
-                    document.querySelectorAll('.l-gallery img, .gallery img, [class*="gallery"] img, [class*="slider"] img').forEach(img => {
-                        if (img.src && !img.src.includes('data:image')) urls.add(img.src);
+                    document.querySelectorAll('a.l-catalog-card__gallery-item img, [data-fancybox="gallery-card"] img').forEach(img => {
+                        if (img.src && !img.src.includes('data:image')) {
+                            urls.add(img.src);
+                        }
                     });
-                    // Вариант 2: любые крупные картинки на странице
-                    if (urls.size === 0) {
-                        document.querySelectorAll('img').forEach(img => {
-                            if (img.src && (img.naturalWidth > 300 || (img.width > 300)) && !img.src.includes('data:image')) {
-                                urls.add(img.src);
-                            }
-                        });
-                    }
                     return Array.from(urls);
                 }
             """)
 
-            logger.info(f"   📸 Найдено {len(photo_urls)} фото в карточке")
+            logger.info(f"   📸 Найдено {len(photo_urls)} фото в галерее")
 
-            # Скачиваем каждое фото через браузер (в контексте сессии)
             downloaded = 0
-            for i, url in enumerate(photo_urls[:10]):  # максимум 10 фото
+            for i, url in enumerate(photo_urls[:MAX_IMAGES]):
                 try:
                     full_url = urljoin(BASE_URL, url)
                     response = await context.request.get(full_url, timeout=15000)
@@ -257,9 +255,9 @@ class ILeasingParser:
                             with open(filepath, "wb") as f:
                                 f.write(content)
                             downloaded += 1
-                            logger.info(f"   ✅ Фото {i+1}: {len(content)} байт")
+                            logger.info(f"   ✅ Фото {i+1}: {len(content)} байт, {full_url[-50:]}")
                         else:
-                            logger.warning(f"   ⚠️ Фото {i+1} не является картинкой (сигнатура: {content[:8].hex()})")
+                            logger.warning(f"   ⚠️ Фото {i+1} не картинка (hex: {content[:8].hex()})")
                     else:
                         logger.warning(f"   ⚠️ Фото {i+1}: HTTP {response.status}")
                 except Exception as e:
