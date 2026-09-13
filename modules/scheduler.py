@@ -1,13 +1,15 @@
-# modules/scheduler.py v-2
+# modules/scheduler.py
 """
 Планировщик на APScheduler.
-- publish_random_post — публикует 1 пост из listings.db (можно вызвать вручную)
+- publish_random_post — публикует 1 пост из listings.db, используя base64 фото
 - cleanup_old_posts — удаляет старые посты при превышении лимита
 - refresh_listings — скачивает свежую listings.db из ветки state
 """
 
 import os
 import io
+import json
+import base64
 import random
 import logging
 import sqlite3
@@ -44,6 +46,7 @@ def init_scheduler(api, db, publisher, description_gen, chat_id: str):
 
 
 def refresh_listings():
+    """Скачивает listings.db из ветки state."""
     try:
         r = requests.get(LISTINGS_URL, timeout=30)
         if r.status_code == 200:
@@ -79,94 +82,102 @@ def get_random_pending_listing() -> dict:
 
 
 def mark_listing_published(url: str):
+    """Помечает карточку как published и УДАЛЯЕТ base64 (экономия места)."""
     conn = sqlite3.connect(LISTINGS_PATH, timeout=10)
     try:
         conn.execute(
-            "UPDATE listings SET status = 'published' WHERE url = ?",
+            "UPDATE listings SET status = 'published', image_base64 = NULL WHERE url = ?",
             (url,)
         )
         conn.commit()
+        logger.info(f"🗑️ base64 удалён для {url[:50]}...")
     finally:
         conn.close()
 
 
-def download_image(url: str) -> bytes:
+def upload_image_to_max(image_base64: str) -> str:
     """
-    Скачивает фото по URL и конвертирует в JPEG при необходимости.
-    MAX API поддерживает только JPG/JPEG/PNG/GIF/TIFF/BMP/HEIC.
-    WebP конвертируется в JPEG [citation:1][citation:7].
+    Загружает изображение в MAX API из base64.
+    Возвращает токен для attachments.
+    
+    Согласно документации MAX [citation:1]:
+    - POST /uploads?type=image → получаем url
+    - POST upload_url → загружаем файл
+    - Для изображений payload берётся из ответа шага 2
     """
+    if not image_base64:
+        return None
+    
     try:
-        logger.info(f"⬇️ Скачиваю фото: {url}")
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-            "Referer": "https://www.ileasing.ru/",
-        }
-        r = requests.get(url, headers=headers, timeout=30, verify=False)
-
-        content_type = r.headers.get("Content-Type", "неизвестно")
-        logger.info(f"⬇️ HTTP {r.status_code}, Content-Type: {content_type}, размер: {len(r.content)} байт")
-
-        if r.status_code != 200 or not r.content:
-            logger.warning(f"⚠️ Фото {url}: HTTP {r.status_code}")
+        image_bytes = base64.b64decode(image_base64)
+        logger.info(f"📤 Загрузка в MAX: {len(image_bytes)} байт")
+        
+        # ШАГ 1: Получаем URL
+        response = requests.post(
+            f"{_api.base_url}/uploads",
+            headers={"Authorization": _api.token},
+            params={"type": "image"},
+            timeout=30,
+            verify=False
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"❌ Ошибка /uploads: {response.status_code} - {response.text[:200]}")
             return None
-
-        sig = r.content[:12]
-        logger.info(f"⬇️ Первые 12 байт (hex): {sig.hex()}")
-
-        if sig[:3] == b'\xff\xd8\xff':
-            logger.info("✅ Формат: JPEG")
-            return r.content
-        elif sig[:4] == b'RIFF' and sig[8:12] == b'WEBP':
-            logger.warning("⚠️ Формат: WebP → конвертирую в JPEG")
-            try:
-                from PIL import Image
-                img = Image.open(io.BytesIO(r.content))
-                if img.mode in ('RGBA', 'P'):
-                    img = img.convert('RGB')
-                output = io.BytesIO()
-                img.save(output, format='JPEG', quality=85)
-                jpeg_bytes = output.getvalue()
-                logger.info(f"✅ WebP→JPEG: {len(jpeg_bytes)} байт")
-                return jpeg_bytes
-            except Exception as e:
-                logger.error(f"❌ Ошибка конвертации WebP: {e}")
-                return None
-        elif sig[:8] == b'\x89PNG\r\n\x1a\n':
-            logger.info("✅ Формат: PNG")
-            return r.content
-        elif sig[:3] == b'GIF':
-            logger.info("✅ Формат: GIF")
-            return r.content
+        
+        upload_data = response.json()
+        upload_url = upload_data.get('url')
+        
+        if not upload_url:
+            logger.error(f"❌ Нет url в ответе: {upload_data}")
+            return None
+        
+        # ШАГ 2: Загружаем файл
+        files = {'data': ('photo.jpg', image_bytes, 'image/jpeg')}
+        upload_response = requests.post(
+            upload_url,
+            files=files,
+            timeout=60,
+            verify=False
+        )
+        
+        if upload_response.status_code != 200:
+            logger.error(f"❌ Ошибка загрузки: {upload_response.status_code} - {upload_response.text[:200]}")
+            return None
+        
+        # Для изображений токен в структуре photos
+        upload_result = upload_response.json()
+        logger.info(f"📤 Ответ шага 2: {upload_result}")
+        
+        token = None
+        if 'photos' in upload_result:
+            for key, photo_data in upload_result['photos'].items():
+                if isinstance(photo_data, dict) and 'token' in photo_data:
+                    token = photo_data['token']
+                    break
+        
+        if not token and 'token' in upload_result:
+            token = upload_result['token']
+        
+        if token:
+            logger.info(f"✅ Токен получен: {token[:30]}...")
         else:
-            logger.warning(f"⚠️ Неизвестный формат, пробую конвертировать...")
-            try:
-                from PIL import Image
-                img = Image.open(io.BytesIO(r.content))
-                if img.mode in ('RGBA', 'P'):
-                    img = img.convert('RGB')
-                output = io.BytesIO()
-                img.save(output, format='JPEG', quality=85)
-                return output.getvalue()
-            except Exception as e:
-                logger.error(f"❌ Не удалось конвертировать: {e}")
-                return None
-
+            logger.error(f"❌ Токен не найден: {upload_result}")
+        
+        return token
+        
     except Exception as e:
-        logger.error(f"❌ Ошибка скачивания фото {url}: {e}")
+        logger.error(f"❌ Ошибка загрузки в MAX: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
 def publish_random_post(force: bool = False):
     """
     Публикует один случайный пост из listings.db.
-    force=True — ручной запуск (игнорирует проверки).
+    Использует base64 фото из БД → загружает в MAX → публикует.
+    После публикации base64 удаляется для экономии места.
     """
     logger.info(f"📤 Запуск публикации (force={force})...")
 
@@ -179,24 +190,17 @@ def publish_random_post(force: bool = False):
 
     logger.info(f"📦 Выбрана карточка: {listing['title']}")
 
-    # ============ ФОТО: ЗАГРУЗКА В MAX ============
+    # ============ ФОТО ИЗ BASE64 ============
     image_token = None
-    image_url = listing.get("image")
-    logger.info(f"🖼️ image URL из БД: {image_url!r}")
-
-    if image_url:
-        image_bytes = download_image(image_url)
-        logger.info(f"📥 Скачано байт: {len(image_bytes) if image_bytes else 0}")
-
-        if image_bytes:
-            # Загружаем в MAX API и получаем токен
-            image_token = _api.upload_file(image_bytes, "photo.jpg")
-            logger.info(f"🎫 Токен после upload: {image_token!r}")
-        else:
-            logger.error(f"❌ Не удалось скачать фото: {image_url}")
+    image_base64 = listing.get("image_base64")
+    
+    if image_base64:
+        logger.info(f"🖼️ base64 найден: {len(image_base64)} символов")
+        image_token = upload_image_to_max(image_base64)
+        logger.info(f"🎫 Токен после upload: {image_token!r}")
     else:
-        logger.warning("⚠️ В БД нет URL фото для этой карточки")
-
+        logger.warning("⚠️ В БД нет base64 для этой карточки")
+    
     logger.info(f"🧪 Итог: image_token={'ЕСТЬ' if image_token else 'НЕТ'}")
     # ==========================================
 
@@ -232,8 +236,10 @@ def publish_random_post(force: bool = False):
             ok = _api.send_message_to_chat(target_chat, post_text)
 
     if ok:
+        # Помечаем published И удаляем base64
         mark_listing_published(listing["url"])
 
+        # Сохраняем запись для будущего удаления из канала
         _db.add_publication(
             listing_id=listing["id"],
             external_id=listing.get("external_id") or listing["url"],
@@ -266,6 +272,7 @@ def cleanup_old_posts():
             _db.mark_deleted(post["id"])
             continue
 
+        # Удаляем из канала через DELETE /messages [citation:3]
         success = _api.delete_message(message_id)
         if success:
             _db.mark_deleted(post["id"])
