@@ -116,6 +116,7 @@ class ILeasingParser:
                     "Chrome/122.0.0.0 Safari/537.36"
                 ),
                 viewport={"width": 1440, "height": 900},
+                ignore_https_errors=True,   # ✅ ИСПРАВЛЕНИЕ: игнорируем ошибки SSL (сертификат Минцифры)
             )
             page = await context.new_page()
 
@@ -265,7 +266,8 @@ class ILeasingParser:
             for i, url in enumerate(photo_urls[:MAX_IMAGES]):
                 try:
                     full_url = urljoin(BASE_URL, url)
-                    response = await context.request.get(full_url, timeout=15000)
+                    # ✅ ИСПРАВЛЕНИЕ: увеличен таймаут до 30 сек (фото медленно отдаются)
+                    response = await context.request.get(full_url, timeout=30000)
                     if response.status == 200:
                         content = await response.body()
                         if not content:
