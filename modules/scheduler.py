@@ -1,10 +1,11 @@
-# modules/scheduler.py
+# modules/scheduler.py   4
 """
 Планировщик на APScheduler.
 - publish_random_post — публикует 1 пост из pending_queue (до 3 фото)
 - cleanup_old_posts — удаляет старые посты при превышении лимита
 - refresh_listings — скачивает свежую listings.db из ветки state
 - apply_schedule — пересоздаёт задания по заданной частоте
+- _ensure_fresh_queue — автоочистка старых записей без images_base64
 """
 
 import os
@@ -27,7 +28,7 @@ LISTINGS_PATH = "data/listings.db"
 
 MAX_POSTS_IN_CHANNEL = 2000
 CHAT_ID = None
-PUBLISH_HOURS = list(range(8, 20))   # часы, в которые можно публиковать
+PUBLISH_HOURS = list(range(8, 20))
 
 _api = None
 _db = None
@@ -44,6 +45,38 @@ def init_scheduler(api, db, publisher, description_gen, chat_id: str):
     _description_gen = description_gen
     CHAT_ID = chat_id
     logger.info(f"✅ Планировщик инициализирован (chat_id={chat_id})")
+
+
+def _ensure_fresh_queue():
+    """
+    ✅ АВТООЧИСТКА: удаляет из pending_queue записи без images_base64.
+    Нужно после обновления схемы (раньше хранилось 1 фото, теперь — до 3).
+    """
+    if _db is None:
+        logger.warning("⚠️ _db не инициализирован — пропускаю очистку")
+        return
+
+    try:
+        with _db._connect() as conn:
+            # Считаем всего и без images_base64
+            total = conn.execute("SELECT COUNT(*) FROM pending_queue").fetchone()[0]
+            old_count = conn.execute(
+                "SELECT COUNT(*) FROM pending_queue WHERE images_base64 IS NULL OR images_base64 = ''"
+            ).fetchone()[0]
+
+            logger.info(f"📊 pending_queue: всего {total}, старых (без images_base64): {old_count}")
+
+            if old_count > 0:
+                logger.warning(f"⚠️ Найдено {old_count} старых записей без images_base64 — очищаю")
+                conn.execute(
+                    "DELETE FROM pending_queue WHERE images_base64 IS NULL OR images_base64 = ''"
+                )
+                conn.commit()
+                logger.info(f"✅ Удалено {old_count} старых записей")
+            else:
+                logger.info("✅ Старых записей нет — все с images_base64")
+    except Exception as e:
+        logger.error(f"❌ Ошибка автоочистки pending_queue: {e}")
 
 
 def refresh_listings():
@@ -178,14 +211,15 @@ def upload_multiple_images(listing: dict) -> list:
     """Загружает до 3 изображений из base64 и возвращает список токенов."""
     tokens = []
 
-    # Пробуем images_base64 (новый формат — массив)
     images_b64_json = listing.get("images_base64")
     if images_b64_json:
         try:
             images_list = json.loads(images_b64_json)
             if isinstance(images_list, list) and images_list:
+                n = min(len(images_list), 3)
+                logger.info(f"📤 Найдено в images_base64: {len(images_list)} фото, загружаю {n}")
                 for idx, b64 in enumerate(images_list[:3]):
-                    logger.info(f"📤 Загрузка фото {idx+1}/{len(images_list[:3])}")
+                    logger.info(f"📤 Загрузка фото {idx+1}/{n}")
                     token = upload_image_to_max(b64)
                     if token:
                         tokens.append(token)
@@ -196,7 +230,6 @@ def upload_multiple_images(listing: dict) -> list:
         except Exception as e:
             logger.error(f"❌ Ошибка парсинга images_base64: {e}")
 
-    # Fallback: одно фото
     single_b64 = listing.get("image_base64")
     if single_b64:
         logger.info("📤 Fallback: загрузка одного фото")
@@ -221,7 +254,6 @@ def publish_random_post(force: bool = False):
 
     logger.info(f"📦 Выбрана карточка: {listing.get('title')}")
 
-    # ============ ЗАГРУЗКА ФОТО (до 3) ============
     logger.info("-" * 60)
     logger.info("🖼️ ЭТАП: ЗАГРУЗКА ФОТО (до 3)")
     logger.info("-" * 60)
@@ -230,10 +262,8 @@ def publish_random_post(force: bool = False):
     logger.info(f"🧪 Итог: получено токенов {len(image_tokens)}")
     logger.info("-" * 60)
 
-    # ============ ТЕКСТ ============
     post_text = _description_gen.generate_post(listing)
 
-    # ============ TEST_MODE / БОЕВОЙ ============
     test_mode = os.environ.get("TEST_MODE", "false").lower() == "true"
     target_chat = CHAT_ID
 
@@ -255,7 +285,6 @@ def publish_random_post(force: bool = False):
     else:
         logger.info(f"🔴 БОЕВОЙ РЕЖИМ: публикация в {target_chat}")
 
-    # ============ ПУБЛИКАЦИЯ ============
     if image_tokens:
         logger.info(f"📤 Отправка С ФОТО ({len(image_tokens)} шт.) в {target_chat}")
         ok = _api.send_message_with_attachments(target_chat, post_text, image_tokens)
@@ -268,7 +297,6 @@ def publish_random_post(force: bool = False):
 
     logger.info(f"📤 Результат: {'✅ OK' if ok else '❌ FAIL'}")
 
-    # ============ ПОСТ-ОБРАБОТКА ============
     if ok:
         try:
             _db.add_publication(
@@ -324,53 +352,34 @@ def cleanup_old_posts():
 
 
 def apply_schedule(posts_per_day: int):
-    """
-    Пересоздаёт задания публикации согласно частоте.
-    
-    - posts_per_day = 1..12 → по одному посту в случайные часы из PUBLISH_HOURS
-    - posts_per_day = 13..24 → по 2 поста в час (12 часов × 2 = 24)
-    - posts_per_day = 25..36 → по 3 поста в час
-    - и т.д.
-    """
+    """Пересоздаёт задания публикации согласно частоте."""
     global _scheduler
     if _scheduler is None:
         logger.error("❌ Планировщик не инициализирован")
         return
 
-    # Удаляем старые задачи публикации
     for job in _scheduler.get_jobs():
         if job.id.startswith("publish_"):
             _scheduler.remove_job(job.id)
 
     posts_per_day = max(1, min(int(posts_per_day), 48))
-    hours = PUBLISH_HOURS  # 8..19 (12 часов)
+    hours = PUBLISH_HOURS
     num_hours = len(hours)
-
-    # Сколько постов на каждый час
     per_hour = posts_per_day / num_hours
     total_scheduled = 0
 
     random.seed()
     for hour in hours:
-        count = per_hour
-        # Распределяем равномерно
         if per_hour < 1:
-            # Меньше 1 на час — публикуем только в случайные часы
-            if random.random() < per_hour:
-                count = 1
-            else:
-                count = 0
+            count = 1 if random.random() < per_hour else 0
         else:
             count = int(per_hour)
             if random.random() < (per_hour - count):
                 count += 1
 
-        # Ограничение — не больше 4 постов в час
         count = min(count, 4)
-
         minutes_used = set()
         for i in range(count):
-            # Случайная уникальная минута в часе
             for _ in range(10):
                 minute = random.randint(0, 59)
                 if minute not in minutes_used:
@@ -393,9 +402,12 @@ def start_scheduler():
     global _scheduler
     logger.info("⏰ start_scheduler: НАЧАЛО")
 
+    # ✅ АВТООЧИСТКА: удаляем старые записи без images_base64
+    logger.info("🧹 Проверка и очистка pending_queue...")
+    _ensure_fresh_queue()
+
     _scheduler = BackgroundScheduler(timezone="Europe/Moscow")
 
-    # Расписание по умолчанию
     posts_per_day = _db.get_posts_per_day() if _db else 20
     apply_schedule(posts_per_day)
 
