@@ -1,4 +1,4 @@
-# bot/modules/database.py
+# bot/modules/database.py 4
 """
 SQLite-обёртка для бота-публикатора.
 Хранит:
