@@ -708,3 +708,14 @@ if __name__ == "__main__":
         logger.info("ℹ️ Admin ID не задан. Напишите боту /start.")
 
     app.run(host='0.0.0.0', port=port, threaded=True)
+
+@app.route('/admin_clear_pending', methods=['GET', 'POST'])
+def admin_clear_pending():
+    try:
+        with db._connect() as conn:
+            cnt = conn.execute("SELECT COUNT(*) FROM pending_queue").fetchone()[0]
+            conn.execute("DELETE FROM pending_queue")
+            conn.commit()
+        return jsonify({"success": True, "message": f"Удалено {cnt} записей из pending_queue"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
