@@ -17,6 +17,7 @@ import json
 import random
 import logging
 import asyncio
+import io
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -72,6 +73,25 @@ def parse_price(text: str) -> Optional[int]:
         return None
     digits = re.sub(r"[^\d]", "", text)
     return int(digits) if digits else None
+
+
+def convert_to_jpeg(image_bytes: bytes) -> Optional[bytes]:
+    """
+    ✅ ИСПРАВЛЕНИЕ: Конвертирует любое изображение в JPEG.
+    MAX поддерживает: JPG, JPEG, PNG, GIF, TIFF, BMP, HEIC.
+    WebP НЕ поддерживается — конвертируем.
+    """
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(image_bytes))
+        if img.mode in ('RGBA', 'P'):
+            img = img.convert('RGB')
+        output = io.BytesIO()
+        img.save(output, format='JPEG', quality=85)
+        return output.getvalue()
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка конвертации в JPEG: {e}")
+        return None
 
 
 class ILeasingParser:
@@ -204,9 +224,9 @@ class ILeasingParser:
 
     async def _download_images_for_listing(self, context, external_id: str, card_url: str) -> int:
         """
-        Открывает карточку товара, собирает все фото из галереи
-        (a.l-catalog-card__gallery-item), скачивает их через контекст браузера.
-        Возвращает количество успешно скачанных фото.
+        Открывает карточку товара, собирает все фото из галереи,
+        конвертирует в JPEG и сохраняет.
+        ✅ ИСПРАВЛЕНИЕ: добавлена конвертация WebP/PNG → JPEG.
         """
         save_dir = os.path.join(IMAGES_DIR, external_id)
         os.makedirs(save_dir, exist_ok=True)
@@ -249,15 +269,39 @@ class ILeasingParser:
                     response = await context.request.get(full_url, timeout=15000)
                     if response.status == 200:
                         content = await response.body()
-                        # Проверяем сигнатуру
-                        if content[:3] == b'\xff\xd8\xff' or content[:8] == b'\x89PNG\r\n\x1a\n':
+                        if not content:
+                            continue
+
+                        # ✅ ИСПРАВЛЕНИЕ: определяем формат и конвертируем в JPEG
+                        sig = content[:12]
+                        if sig[:3] == b'\xff\xd8\xff':
+                            # Уже JPEG
+                            jpeg_bytes = content
+                            logger.info(f"   ✅ Фото {i+1}: JPEG, {len(jpeg_bytes)} байт")
+                        elif sig[:8] == b'\x89PNG\r\n\x1a\n':
+                            # PNG — конвертируем
+                            jpeg_bytes = convert_to_jpeg(content)
+                            logger.info(f"   ✅ Фото {i+1}: PNG→JPEG, {len(jpeg_bytes) if jpeg_bytes else 0} байт")
+                        elif sig[:4] == b'RIFF' and sig[8:12] == b'WEBP':
+                            # WebP — конвертируем (MAX не поддерживает!)
+                            jpeg_bytes = convert_to_jpeg(content)
+                            logger.info(f"   ✅ Фото {i+1}: WebP→JPEG, {len(jpeg_bytes) if jpeg_bytes else 0} байт")
+                        else:
+                            # Пробуем конвертировать любое
+                            jpeg_bytes = convert_to_jpeg(content)
+                            if jpeg_bytes:
+                                logger.info(f"   ✅ Фото {i+1}: конвертировано, {len(jpeg_bytes)} байт")
+                            else:
+                                logger.warning(f"   ⚠️ Фото {i+1} не удалось конвертировать (hex: {sig.hex()})")
+                                continue
+
+                        if jpeg_bytes:
                             filepath = os.path.join(save_dir, f"{i+1}.jpg")
                             with open(filepath, "wb") as f:
-                                f.write(content)
+                                f.write(jpeg_bytes)
                             downloaded += 1
-                            logger.info(f"   ✅ Фото {i+1}: {len(content)} байт, {full_url[-50:]}")
                         else:
-                            logger.warning(f"   ⚠️ Фото {i+1} не картинка (hex: {content[:8].hex()})")
+                            logger.warning(f"   ⚠️ Фото {i+1}: конвертация вернула None")
                     else:
                         logger.warning(f"   ⚠️ Фото {i+1}: HTTP {response.status}")
                 except Exception as e:
