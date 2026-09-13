@@ -95,7 +95,7 @@ class APIClient:
                 verify=False
             )
             if response.status_code != 200:
-                logger.error(f"❌ send_message: {response.status_code} - {response.text[:200]}")
+                logger.error(f"❌ send_message: {response.status_code}")
             return response.status_code == 200
         except Exception as e:
             logger.error(f"❌ Ошибка отправки: {e}")
@@ -116,7 +116,7 @@ class APIClient:
             )
             if response.status_code == 200:
                 return True
-            logger.error(f"❌ send_message_to_chat: {response.status_code} - {response.text[:200]}")
+            logger.error(f"❌ send_message_to_chat: {response.status_code}")
             return False
         except Exception as e:
             logger.error(f"❌ Ошибка: {e}")
@@ -132,7 +132,7 @@ class APIClient:
                 "format": "markdown",
                 "attachments": attachments
             }
-            logger.info(f"📤 send_message_with_attachments: chat_id={chat_id}, tokens={tokens}")
+            logger.info(f"📤 send_message_with_attachments: chat_id={chat_id}, tokens={len(tokens)} шт.")
             response = requests.post(
                 f"{self.base_url}/messages",
                 headers={"Authorization": self.token, "Content-Type": "application/json"},
@@ -150,98 +150,6 @@ class APIClient:
             logger.error(f"❌ Ошибка: {e}")
             return False
 
-    def upload_file(self, image_bytes, filename='image.jpg'):
-        """
-        Загрузка изображения в MAX API.
-        Согласно документации :
-        - ШАГ 1: POST /uploads?type=image → url
-        - ШАГ 2: POST upload_url → загрузка файла
-        - Токен извлекается из ответа шага 2 (структура photos)
-        """
-        if not self.token:
-            logger.error("❌ Нет токена для загрузки")
-            return None
-
-        try:
-            # ШАГ 1: Получаем URL
-            logger.info(f"📤 ШАГ 1: Запрос upload URL ({len(image_bytes)} байт)")
-            response = requests.post(
-                f"{self.base_url}/uploads",
-                headers={"Authorization": self.token},
-                params={"type": "image"},
-                timeout=30,
-                verify=False
-            )
-            logger.info(f"📤 ШАГ 1: HTTP {response.status_code}, ответ: {response.text[:500]}")
-
-            if response.status_code != 200:
-                logger.error(f"❌ Ошибка получения URL: {response.status_code} - {response.text[:300]}")
-                return None
-
-            try:
-                upload_data = response.json()
-            except ValueError:
-                logger.error(f"❌ Невалидный JSON: {response.text[:200]}")
-                return None
-
-            upload_url = upload_data.get('url')
-            token = upload_data.get('token')  # Может прийти уже здесь
-
-            logger.info(f"📤 Получен upload_url: {upload_url}")
-            logger.info(f"📤 Токен на шаге 1: {token[:40] if token else 'НЕТ'}")
-
-            if not upload_url:
-                logger.error(f"❌ Не получен URL: {upload_data}")
-                return None
-
-            # ШАГ 2: Загружаем файл
-            files = {'data': (filename, image_bytes, 'image/jpeg')}
-            logger.info(f"📤 ШАГ 2: POST на {upload_url}")
-
-            upload_response = requests.post(
-                upload_url,
-                files=files,
-                timeout=60,
-                verify=False
-            )
-            logger.info(f"📤 ШАГ 2: HTTP {upload_response.status_code}, ответ: {upload_response.text[:500]}")
-
-            if upload_response.status_code != 200:
-                logger.error(f"❌ Ошибка загрузки: {upload_response.status_code} - {upload_response.text[:200]}")
-                return None
-
-            # Если токен не пришёл на шаге 1 — пробуем шаг 2
-            if not token:
-                try:
-                    upload_result = upload_response.json()
-                    logger.info(f"📤 ШАГ 2: JSON ответа: {upload_result}")
-
-                    if 'photos' in upload_result and isinstance(upload_result['photos'], dict):
-                        for photo_key, photo_data in upload_result['photos'].items():
-                            if isinstance(photo_data, dict) and 'token' in photo_data:
-                                token = photo_data['token']
-                                logger.info(f"✅ Токен найден в photos[{photo_key}]: {token[:40]}...")
-                                break
-
-                    if not token and 'token' in upload_result:
-                        token = upload_result['token']
-                        logger.info(f"✅ Токен найден на верхнем уровне: {token[:40]}...")
-                except ValueError:
-                    logger.warning(f"⚠️ Не удалось распарсить JSON шага 2: {upload_response.text[:200]}")
-
-            if not token:
-                logger.error(f"❌ Токен не найден ни на шаге 1, ни на шаге 2")
-                return None
-
-            logger.info(f"✅ Файл загружен, токен: {token[:40]}...")
-            return token
-
-        except Exception as e:
-            logger.error(f"❌ Исключение при загрузке: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-
     def delete_message(self, message_id):
         if not self.token or not message_id:
             return False
@@ -253,11 +161,7 @@ class APIClient:
                 timeout=30,
                 verify=False
             )
-            if response.status_code == 200:
-                logger.info(f"🗑️ Удалено сообщение {message_id}")
-                return True
-            logger.error(f"❌ Ошибка удаления {message_id}: {response.status_code}")
-            return False
+            return response.status_code == 200
         except Exception as e:
             logger.error(f"❌ Ошибка удаления: {e}")
             return False
@@ -394,12 +298,19 @@ ADMIN_PAGE = """
         .btn-secondary:hover { background: #545b62; }
         .btn-warning { background: #ffc107; color: #333; }
         .btn-warning:hover { background: #e0a800; }
+        .btn-success { background: #28a745; color: white; }
+        .btn-success:hover { background: #218838; }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         .log { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 8px; font-family: 'Courier New', monospace; font-size: 12px; max-height: 300px; overflow-y: auto; margin-top: 15px; white-space: pre-wrap; line-height: 1.5; }
         .mode-badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; margin-left: 10px; }
         .mode-test { background: #fff3cd; color: #856404; }
         .mode-live { background: #d4edda; color: #155724; }
         .warning { background: #fff3cd; padding: 12px 15px; border-radius: 8px; border-left: 4px solid #ffc107; margin-bottom: 15px; font-size: 14px; color: #856404; }
+        .freq-grid { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+        .freq-btn { padding: 10px 20px; border: 2px solid #007bff; background: white; color: #007bff; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+        .freq-btn:hover { background: #e7f5ff; }
+        .freq-btn.active { background: #007bff; color: white; }
+        .freq-current { color: #28a745; font-weight: 600; }
     </style>
 </head>
 <body>
@@ -413,10 +324,25 @@ ADMIN_PAGE = """
             <div id="stats">Загрузка...</div>
         </div>
         <div class="card">
+            <h2>📅 Частота публикации</h2>
+            <p style="font-size:14px; color:#666; margin-top:0;">
+                Текущая частота: <span class="freq-current" id="freqValue">—</span>
+            </p>
+            <div class="freq-grid" id="freqGrid">
+                <button class="freq-btn" onclick="setFrequency(1)">1/день</button>
+                <button class="freq-btn" onclick="setFrequency(2)">2/день</button>
+                <button class="freq-btn" onclick="setFrequency(3)">3/день</button>
+                <button class="freq-btn" onclick="setFrequency(5)">5/день</button>
+                <button class="freq-btn" onclick="setFrequency(10)">10/день</button>
+                <button class="freq-btn" onclick="setFrequency(20)">20/день</button>
+            </div>
+            <div id="freqLog" style="margin-top:10px; font-size:13px;"></div>
+        </div>
+        <div class="card">
             <h2>🚀 Ручное управление</h2>
             <div class="warning">
                 ⚠️ Кнопка «Опубликовать сейчас» запустит публикацию немедленно.<br>
-                Если <strong>TEST_MODE=true</strong> — пост придёт вам в личку, а не в канал.
+                Если <strong>TEST_MODE=true</strong> — пост придёт вам в личку.
             </div>
             <button class="btn btn-primary" onclick="publishNow()">🚀 Опубликовать сейчас</button>
             <button class="btn btn-secondary" onclick="refreshListings()">🔄 Обновить listings.db</button>
@@ -447,9 +373,38 @@ ADMIN_PAGE = """
                     '<div class="status-row"><span class="status-label">📦 Опубликовано</span><span class="status-value">' + d.published_total + '</span></div>' +
                     '<div class="status-row"><span class="status-label">⏳ В очереди</span><span class="status-value">' + d.pending + '</span></div>' +
                     '<div class="status-row"><span class="status-label">📊 Всего в очереди</span><span class="status-value">' + d.listings_total + '</span></div>' +
-                    '<div class="status-row"><span class="status-label">👤 Админ</span><span class="status-value">' + (d.admin_id || '—') + '</span></div>';
+                    '<div class="status-row"><span class="status-label">👤 Админ</span><span class="status-value">' + (d.admin_id || '—') + '</span></div>' +
+                    '<div class="status-row"><span class="status-label">📅 Частота</span><span class="status-value">' + d.posts_per_day + '/день</span></div>';
+                document.getElementById('freqValue').textContent = d.posts_per_day + ' постов/день';
+                // Подсветка активной кнопки
+                document.querySelectorAll('.freq-btn').forEach(btn => {
+                    btn.classList.toggle('active', btn.textContent.startsWith(d.posts_per_day + '/'));
+                });
             } catch (e) {
                 document.getElementById('stats').textContent = 'Ошибка: ' + e.message;
+            }
+        }
+        async function setFrequency(value) {
+            const el = document.getElementById('freqLog');
+            el.textContent = '⏳ Сохранение...';
+            try {
+                const r = await fetch('/admin_settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({posts_per_day: value})
+                });
+                const d = await r.json();
+                if (d.success) {
+                    el.textContent = '✅ ' + d.message;
+                    el.style.color = '#28a745';
+                    loadStats();
+                } else {
+                    el.textContent = '❌ ' + d.message;
+                    el.style.color = '#dc3545';
+                }
+            } catch (e) {
+                el.textContent = '❌ ' + e.message;
+                el.style.color = '#dc3545';
             }
         }
         async function publishNow() {
@@ -534,9 +489,33 @@ def admin_stats():
             "admin_id": admin_id,
             "channel_id": CHANNEL_ID,
             "test_mode": os.environ.get("TEST_MODE", "false").lower() == "true",
+            "posts_per_day": db.get_posts_per_day(),
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin_settings', methods=['POST'])
+def admin_settings():
+    try:
+        data = request.get_json()
+        if not data or "posts_per_day" not in data:
+            return jsonify({"success": False, "message": "Нет posts_per_day"}), 400
+
+        value = int(data["posts_per_day"])
+        if value < 1 or value > 48:
+            return jsonify({"success": False, "message": "Допустимо 1-48"}), 400
+
+        db.set_posts_per_day(value)
+        sched_module.apply_schedule(value)
+
+        return jsonify({
+            "success": True,
+            "message": f"Частота изменена на {value} постов/день. Расписание обновлено."
+        })
+    except Exception as e:
+        logger.error(f"❌ Ошибка admin_settings: {e}")
+        return jsonify({"success": False, "message": str(e)}), 500
 
 
 @app.route('/submit_consultation', methods=['POST'])
@@ -576,7 +555,6 @@ def submit_consultation():
             'message': 'Заявка отправлена',
             'consultation_id': consultation_id
         })
-
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
@@ -644,8 +622,9 @@ def webhook():
                     f"📊 **Статус бота**\n\n"
                     f"📦 Опубликовано: {stats.get('published_total', 0)}\n"
                     f"⏳ В очереди: {pending_q}\n"
+                    f"📅 Частота: {db.get_posts_per_day()}/день\n"
                     f"📡 Канал: `{CHANNEL_ID}`\n"
-                    f"🧪 Тестовый режим: {'ДА' if test_mode else 'НЕТ'}"
+                    f"🧪 TEST_MODE: {'ДА' if test_mode else 'НЕТ'}"
                 )
                 return jsonify({"ok": True}), 200
 
