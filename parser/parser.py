@@ -1,4 +1,4 @@
-# parser/parser.py v -2
+# parser/parser.py
 """
 Парсер каталога ileasing.ru на Playwright.
 
@@ -7,7 +7,7 @@
 2. Обходит страницы каталога (?PAGEN_1=N), собирает карточки.
 3. Фильтрует: цена >= MIN_PRICE, href ещё нет в БД.
 4. Для новых карточек: заходит в карточку, скачивает ВСЕ фото через браузер.
-5. Сохраняет: listings.db + data/images/{external_id}/*.jpg
+5. Сохраняет: listings.db + data/images/{external_id}/*.jpg + base64 первого фото.
 6. Цель — 20 новых карточек за запуск. Лимит — 5 категорий.
 """
 
@@ -18,6 +18,7 @@ import random
 import logging
 import asyncio
 import io
+import base64
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -76,11 +77,7 @@ def parse_price(text: str) -> Optional[int]:
 
 
 def convert_to_jpeg(image_bytes: bytes) -> Optional[bytes]:
-    """
-    Конвертирует любое изображение в JPEG.
-    MAX API поддерживает только: JPG, JPEG, PNG, GIF, TIFF, BMP, HEIC.
-    WebP НЕ поддерживается — конвертируем [citation:1][citation:7].
-    """
+    """Конвертирует любое изображение в JPEG (MAX не поддерживает WebP)."""
     try:
         from PIL import Image
         img = Image.open(io.BytesIO(image_bytes))
@@ -189,8 +186,8 @@ class ILeasingParser:
                     stats["skipped_dup"] += 1
                     continue
 
-                # Скачиваем ВСЕ фото из карточки товара
-                images_count = await self._download_images_for_listing(
+                # Скачиваем фото, получаем base64 первого
+                images_count, first_base64 = await self._download_images_for_listing(
                     context, data["external_id"], data["href"]
                 )
                 stats["images_downloaded"] += images_count
@@ -215,18 +212,21 @@ class ILeasingParser:
                     seats=data["props"].get("Количество мест"),
                     image=data["image"],
                     images_path=images_path,
+                    image_base64=first_base64,
                     category=category,
                 )
                 stats["added"] += 1
-                logger.info(f"   ✅ [{stats['added']}/{TARGET_NEW}] {data['title']} — {data['price_text']} ({images_count} фото)")
+                logger.info(f"   ✅ [{stats['added']}/{TARGET_NEW}] {data['title']} — {data['price_text']} ({images_count} фото, base64={'ЕСТЬ' if first_base64 else 'НЕТ'})")
 
             page_num += 1
 
-    async def _download_images_for_listing(self, context, external_id: str, card_url: str) -> int:
+    async def _download_images_for_listing(self, context, external_id: str, card_url: str):
         """
         Открывает карточку товара, собирает все фото из галереи,
-        конвертирует в JPEG и сохраняет.
-        WebP/PNG конвертируются в JPEG, т.к. MAX API не поддерживает WebP.
+        конвертирует в JPEG, сохраняет в файлы и возвращает base64 первого.
+        
+        Returns:
+            (downloaded_count: int, first_image_base64: str | None)
         """
         save_dir = os.path.join(IMAGES_DIR, external_id)
         os.makedirs(save_dir, exist_ok=True)
@@ -236,18 +236,15 @@ class ILeasingParser:
             logger.info(f"   📸 Открываю карточку: {card_url}")
             await page.goto(card_url, wait_until="domcontentloaded", timeout=30000)
 
-            # Ждём появления галереи
             try:
                 await page.wait_for_selector("a.l-catalog-card__gallery-item", timeout=10000)
             except PWTimeoutError:
                 logger.warning(f"   ⚠️ Галерея не найдена в карточке")
-                return 0
+                return 0, None
 
-            # Прокручиваем страницу вниз — чтобы lazy-load подгрузил все фото
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2000)
 
-            # Собираем URL фото — точный селектор
             photo_urls = await page.evaluate("""
                 () => {
                     const urls = new Set();
@@ -263,6 +260,8 @@ class ILeasingParser:
             logger.info(f"   📸 Найдено {len(photo_urls)} фото в галерее")
 
             downloaded = 0
+            first_base64 = None
+            
             for i, url in enumerate(photo_urls[:MAX_IMAGES]):
                 try:
                     full_url = urljoin(BASE_URL, url)
@@ -272,46 +271,34 @@ class ILeasingParser:
                         if not content:
                             continue
 
-                        # Определяем формат и конвертируем в JPEG
                         sig = content[:12]
                         if sig[:3] == b'\xff\xd8\xff':
-                            # Уже JPEG
                             jpeg_bytes = content
-                            logger.info(f"   ✅ Фото {i+1}: JPEG, {len(jpeg_bytes)} байт")
                         elif sig[:8] == b'\x89PNG\r\n\x1a\n':
-                            # PNG — конвертируем
                             jpeg_bytes = convert_to_jpeg(content)
-                            logger.info(f"   ✅ Фото {i+1}: PNG→JPEG, {len(jpeg_bytes) if jpeg_bytes else 0} байт")
                         elif sig[:4] == b'RIFF' and sig[8:12] == b'WEBP':
-                            # WebP — конвертируем (MAX не поддерживает!)
                             jpeg_bytes = convert_to_jpeg(content)
-                            logger.info(f"   ✅ Фото {i+1}: WebP→JPEG, {len(jpeg_bytes) if jpeg_bytes else 0} байт")
                         else:
-                            # Пробуем конвертировать любое
                             jpeg_bytes = convert_to_jpeg(content)
-                            if jpeg_bytes:
-                                logger.info(f"   ✅ Фото {i+1}: конвертировано, {len(jpeg_bytes)} байт")
-                            else:
-                                logger.warning(f"   ⚠️ Фото {i+1} не удалось конвертировать (hex: {sig.hex()})")
-                                continue
 
                         if jpeg_bytes:
                             filepath = os.path.join(save_dir, f"{i+1}.jpg")
                             with open(filepath, "wb") as f:
                                 f.write(jpeg_bytes)
                             downloaded += 1
-                        else:
-                            logger.warning(f"   ⚠️ Фото {i+1}: конвертация вернула None")
-                    else:
-                        logger.warning(f"   ⚠️ Фото {i+1}: HTTP {response.status}")
+                            
+                            # ✅ Сохраняем base64 первого фото
+                            if first_base64 is None:
+                                first_base64 = base64.b64encode(jpeg_bytes).decode('ascii')
+                                logger.info(f"   ✅ Фото {i+1}: сохранено ({len(jpeg_bytes)} байт), base64 первого готов")
                 except Exception as e:
                     logger.warning(f"   ⚠️ Ошибка скачивания фото {i+1}: {e}")
 
-            return downloaded
+            return downloaded, first_base64
 
         except Exception as e:
             logger.error(f"   ❌ Ошибка в карточке {card_url}: {e}")
-            return 0
+            return 0, None
         finally:
             await page.close()
 
