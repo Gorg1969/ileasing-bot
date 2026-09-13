@@ -1,4 +1,4 @@
-# parser/database.py
+# parser/database.py 3
 """
 SQLite-обёртка для парсера.
 Хранит только listings (спарсенные карточки) + base64 изображения.
