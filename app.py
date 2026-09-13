@@ -105,10 +105,12 @@ class APIClient:
         if not self.token:
             return False
         try:
-            payload = {"chat_id": chat_id, "text": text, "format": "markdown"}
+            payload = {"text": text, "format": "markdown"}
+            # ✅ ИСПРАВЛЕНИЕ: chat_id передаём в query-параметрах
             response = requests.post(
                 f"{self.base_url}/messages",
                 headers={"Authorization": self.token, "Content-Type": "application/json"},
+                params={"chat_id": chat_id},
                 json=payload,
                 timeout=30,
                 verify=False
@@ -127,15 +129,16 @@ class APIClient:
         try:
             attachments = [{"type": "image", "payload": {"token": t}} for t in tokens[:10]]
             payload = {
-                "chat_id": chat_id,
                 "text": text,
                 "format": "markdown",
                 "attachments": attachments
             }
             logger.info(f"📤 send_message_with_attachments: chat_id={chat_id}, tokens={tokens}")
+            # ✅ ИСПРАВЛЕНИЕ: chat_id в query-параметрах, а не в теле
             response = requests.post(
                 f"{self.base_url}/messages",
                 headers={"Authorization": self.token, "Content-Type": "application/json"},
+                params={"chat_id": chat_id},
                 json=payload,
                 timeout=60,
                 verify=False
@@ -207,19 +210,19 @@ class APIClient:
 
             logger.info(f"📤 ШАГ 2: JSON ответа: {upload_result}")
 
-            # ШАГ 3: Извлекаем токен
+            # ✅ ИСПРАВЛЕНИЕ: Для изображений токен лежит в структуре photos
             token = None
             if 'photos' in upload_result and isinstance(upload_result['photos'], dict):
-                for photo_data in upload_result['photos'].values():
+                for photo_key, photo_data in upload_result['photos'].items():
                     if isinstance(photo_data, dict) and 'token' in photo_data:
                         token = photo_data['token']
+                        logger.info(f"✅ Токен найден в photos[{photo_key}]: {token[:30]}...")
                         break
 
+            # Fallback: token может быть на верхнем уровне
             if not token and 'token' in upload_result:
                 token = upload_result['token']
-
-            if not token and 'data' in upload_result and 'token' in upload_result['data']:
-                token = upload_result['data']['token']
+                logger.info(f"✅ Токен найден на верхнем уровне: {token[:30]}...")
 
             if not token:
                 logger.error(f"❌ Токен не найден в ответе: {upload_result}")
