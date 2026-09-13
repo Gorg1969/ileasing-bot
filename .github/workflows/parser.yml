@@ -37,14 +37,34 @@ jobs:
         run: |
           python -m parser.parser
 
-      - name: Commit listings.db and images to state branch
+      # ✅ ИСПРАВЛЕНИЕ: сохраняем свежую БД во временное место,
+      #    чтобы git checkout -B state её не затёр
+      - name: Save fresh listings.db
+        run: |
+          ls -la data/
+          ls -la data/listings.db
+          cp data/listings.db /tmp/fresh_listings.db
+          echo "Размер свежей БД:"
+          stat -c%s /tmp/fresh_listings.db
+
+      - name: Commit to state branch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Переключаемся на ветку state
+          git fetch origin state || true
           git checkout -B state
+
+          # Возвращаем свежую БД на место (git её затёр)
+          cp /tmp/fresh_listings.db data/listings.db
+
+          # Проверяем, что размер вырос
+          echo "Размер БД перед коммитом:"
+          stat -c%s data/listings.db
+
           git add -f data/listings.db
-          git add -f data/images/ || echo "no images"
-          git commit -m "chore: update listings.db and images $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "no changes"
+          git commit -m "chore: update listings.db $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "no changes"
           git push -f origin state
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
