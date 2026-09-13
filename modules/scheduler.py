@@ -1,9 +1,9 @@
 # modules/scheduler.py
 """
 Планировщик на APScheduler.
-- publish_random_post — публикует 1 пост из listings.db, используя base64 фото
+- publish_random_post — публикует 1 пост из pending_queue (с base64 фото)
 - cleanup_old_posts — удаляет старые посты при превышении лимита
-- refresh_listings — скачивает свежую listings.db из ветки state
+- refresh_listings — скачивает свежую listings.db из ветки state и синхронизирует pending_queue
 """
 
 import os
@@ -46,72 +46,42 @@ def init_scheduler(api, db, publisher, description_gen, chat_id: str):
 
 
 def refresh_listings():
-    """Скачивает listings.db из ветки state."""
+    """
+    Скачивает listings.db из ветки state и синхронизирует pending_queue
+    в БД бота (published.db).
+    """
     try:
         r = requests.get(LISTINGS_URL, timeout=30)
-        if r.status_code == 200:
-            os.makedirs(os.path.dirname(LISTINGS_PATH), exist_ok=True)
-            with open(LISTINGS_PATH, "wb") as f:
-                f.write(r.content)
-            logger.info(f"✅ listings.db обновлена ({len(r.content)} байт)")
-            return True
-        logger.error(f"❌ Не удалось скачать listings.db: HTTP {r.status_code}")
-        return False
+        if r.status_code != 200:
+            logger.error(f"❌ Не удалось скачать listings.db: HTTP {r.status_code}")
+            return False
+
+        os.makedirs(os.path.dirname(LISTINGS_PATH), exist_ok=True)
+        with open(LISTINGS_PATH, "wb") as f:
+            f.write(r.content)
+        logger.info(f"✅ listings.db обновлена ({len(r.content)} байт)")
+
+        # ✅ Синхронизируем pending_queue в БД бота
+        if _db:
+            added = _db.sync_pending_from_listings(LISTINGS_PATH)
+            logger.info(f"✅ В pending_queue добавлено: {added}")
+            logger.info(f"📊 Всего в pending_queue: {_db.count_pending_queue()}")
+
+        return True
     except Exception as e:
         logger.error(f"❌ Ошибка скачивания listings.db: {e}")
         return False
 
 
-def get_random_pending_listing() -> dict:
-    if not os.path.exists(LISTINGS_PATH):
-        logger.warning(f"⚠️ {LISTINGS_PATH} не найден")
-        return None
-
-    conn = sqlite3.connect(LISTINGS_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    try:
-        row = conn.execute("""
-            SELECT * FROM listings
-            WHERE status = 'pending'
-            ORDER BY RANDOM()
-            LIMIT 1
-        """).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
-
-
-def mark_listing_published(url: str):
-    """Помечает карточку как published и УДАЛЯЕТ base64 (экономия места)."""
-    conn = sqlite3.connect(LISTINGS_PATH, timeout=10)
-    try:
-        conn.execute(
-            "UPDATE listings SET status = 'published', image_base64 = NULL WHERE url = ?",
-            (url,)
-        )
-        conn.commit()
-        logger.info(f"🗑️ base64 удалён для {url[:50]}...")
-    finally:
-        conn.close()
-
-
 def upload_image_to_max(image_base64: str) -> str:
-    """
-    Загружает изображение в MAX API из base64.
-    Возвращает токен для attachments.
-    
-    Согласно документации MAX [citation:1]:
-    - POST /uploads?type=image → получаем url
-    - POST upload_url → загружаем файл
-    - Для изображений payload берётся из ответа шага 2
-    """
+    """Загружает изображение в MAX API из base64. Возвращает токен."""
     if not image_base64:
         return None
-    
+
     try:
         image_bytes = base64.b64decode(image_base64)
         logger.info(f"📤 Загрузка в MAX: {len(image_bytes)} байт")
-        
+
         # ШАГ 1: Получаем URL
         response = requests.post(
             f"{_api.base_url}/uploads",
@@ -120,18 +90,18 @@ def upload_image_to_max(image_base64: str) -> str:
             timeout=30,
             verify=False
         )
-        
+
         if response.status_code != 200:
             logger.error(f"❌ Ошибка /uploads: {response.status_code} - {response.text[:200]}")
             return None
-        
+
         upload_data = response.json()
         upload_url = upload_data.get('url')
-        
+
         if not upload_url:
             logger.error(f"❌ Нет url в ответе: {upload_data}")
             return None
-        
+
         # ШАГ 2: Загружаем файл
         files = {'data': ('photo.jpg', image_bytes, 'image/jpeg')}
         upload_response = requests.post(
@@ -140,32 +110,32 @@ def upload_image_to_max(image_base64: str) -> str:
             timeout=60,
             verify=False
         )
-        
+
         if upload_response.status_code != 200:
             logger.error(f"❌ Ошибка загрузки: {upload_response.status_code} - {upload_response.text[:200]}")
             return None
-        
-        # Для изображений токен в структуре photos
+
         upload_result = upload_response.json()
-        logger.info(f"📤 Ответ шага 2: {upload_result}")
-        
+        logger.info(f"📤 Ответ шага 2: {str(upload_result)[:300]}")
+
+        # Извлекаем токен
         token = None
-        if 'photos' in upload_result:
+        if 'photos' in upload_result and isinstance(upload_result['photos'], dict):
             for key, photo_data in upload_result['photos'].items():
                 if isinstance(photo_data, dict) and 'token' in photo_data:
                     token = photo_data['token']
                     break
-        
+
         if not token and 'token' in upload_result:
             token = upload_result['token']
-        
+
         if token:
             logger.info(f"✅ Токен получен: {token[:30]}...")
         else:
             logger.error(f"❌ Токен не найден: {upload_result}")
-        
+
         return token
-        
+
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки в MAX: {e}")
         import traceback
@@ -174,18 +144,16 @@ def upload_image_to_max(image_base64: str) -> str:
 
 
 def publish_random_post(force: bool = False):
-    """
-    Публикует один случайный пост из listings.db.
-    Использует base64 фото из БД → загружает в MAX → публикует.
-    После публикации base64 удаляется для экономии места.
-    """
+    """Публикует один случайный пост из pending_queue."""
     logger.info(f"📤 Запуск публикации (force={force})...")
 
+    # Обновляем очередь
     refresh_listings()
 
-    listing = get_random_pending_listing()
+    # Берём из pending_queue
+    listing = _db.get_random_pending()
     if not listing:
-        logger.warning("⚠️ Нет карточек со статусом pending")
+        logger.warning("⚠️ pending_queue пуста — нет карточек для публикации")
         return
 
     logger.info(f"📦 Выбрана карточка: {listing['title']}")
@@ -193,14 +161,14 @@ def publish_random_post(force: bool = False):
     # ============ ФОТО ИЗ BASE64 ============
     image_token = None
     image_base64 = listing.get("image_base64")
-    
+
     if image_base64:
         logger.info(f"🖼️ base64 найден: {len(image_base64)} символов")
         image_token = upload_image_to_max(image_base64)
         logger.info(f"🎫 Токен после upload: {image_token!r}")
     else:
-        logger.warning("⚠️ В БД нет base64 для этой карточки")
-    
+        logger.warning("⚠️ В очереди нет base64 для этой карточки")
+
     logger.info(f"🧪 Итог: image_token={'ЕСТЬ' if image_token else 'НЕТ'}")
     # ==========================================
 
@@ -236,12 +204,12 @@ def publish_random_post(force: bool = False):
             ok = _api.send_message_to_chat(target_chat, post_text)
 
     if ok:
-        # Помечаем published И удаляем base64
-        mark_listing_published(listing["url"])
+        # ✅ Удаляем из очереди (base64 уходит вместе с записью)
+        _db.remove_from_pending(listing["external_id"])
 
-        # Сохраняем запись для будущего удаления из канала
+        # Запись для будущего удаления из канала
         _db.add_publication(
-            listing_id=listing["id"],
+            listing_id=listing.get("listing_id") or 0,
             external_id=listing.get("external_id") or listing["url"],
             url=listing["url"],
             title=listing["title"],
@@ -272,7 +240,6 @@ def cleanup_old_posts():
             _db.mark_deleted(post["id"])
             continue
 
-        # Удаляем из канала через DELETE /messages [citation:3]
         success = _api.delete_message(message_id)
         if success:
             _db.mark_deleted(post["id"])
