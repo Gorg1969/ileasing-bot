@@ -9,7 +9,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Ссылка на страницу с формой консультации
-CONSULTATION_URL = "https://maxbot.bothost.tech/consultation"
+CONSULTATION_URL = "https://zero-bot.bothost.tech/consultation"
 
 
 def generate_post(listing: dict) -> str:
