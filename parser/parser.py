@@ -8,7 +8,7 @@
 3. Фильтрует: цена >= MIN_PRICE, href ещё нет в БД.
 4. Для новых карточек: заходит в карточку, скачивает ВСЕ фото через браузер.
 5. Сохраняет: listings.db + data/images/{external_id}/*.jpg + base64 первого фото.
-6. Цель — 20 новых карточек за запуск. Лимит — 5 категорий.
+6. Цель — 20 новых карточек за запуск. Лимит — 5 категорий, 10 страниц на категорию.
 """
 
 import os
@@ -30,6 +30,7 @@ BASE_URL = "https://www.ileasing.ru"
 MIN_PRICE = 2_200_000
 TARGET_NEW = 20
 MAX_CATEGORIES = 5
+MAX_PAGES_PER_CATEGORY = 10   # ✅ ЗАЩИТА: не больше 10 страниц на категорию
 IMAGES_DIR = "data/images"
 MAX_IMAGES = 10
 
@@ -116,7 +117,7 @@ class ILeasingParser:
                     "Chrome/122.0.0.0 Safari/537.36"
                 ),
                 viewport={"width": 1440, "height": 900},
-                ignore_https_errors=True,   # ✅ ИСПРАВЛЕНИЕ: игнорируем ошибки SSL (сертификат Минцифры)
+                ignore_https_errors=True,   # ✅ игнорируем ошибки SSL (сертификат Минцифры)
             )
             page = await context.new_page()
 
@@ -147,9 +148,10 @@ class ILeasingParser:
 
     async def _process_category(self, context, page: Page, category: str, stats: dict):
         page_num = 1
-        while stats["added"] < TARGET_NEW:
+        # ✅ ЗАЩИТА: не больше MAX_PAGES_PER_CATEGORY страниц на категорию
+        while stats["added"] < TARGET_NEW and page_num <= MAX_PAGES_PER_CATEGORY:
             url = f"{BASE_URL}{category}?PAGEN_1={page_num}"
-            logger.info(f"   📄 Страница {page_num}: {url}")
+            logger.info(f"   📄 Страница {page_num}/{MAX_PAGES_PER_CATEGORY}: {url}")
 
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -165,6 +167,7 @@ class ILeasingParser:
 
             cards = await page.query_selector_all("a.l-catalog-item")
             if not cards:
+                logger.info(f"   ⛔ Пустая страница {page_num}")
                 return
 
             stats["pages_visited"] += 1
@@ -221,6 +224,9 @@ class ILeasingParser:
 
             page_num += 1
 
+        if page_num > MAX_PAGES_PER_CATEGORY:
+            logger.info(f"   🛑 Достигнут лимит страниц ({MAX_PAGES_PER_CATEGORY}) для {category}")
+
     async def _download_images_for_listing(self, context, external_id: str, card_url: str):
         """
         Открывает карточку товара, собирает все фото из галереи,
@@ -266,7 +272,6 @@ class ILeasingParser:
             for i, url in enumerate(photo_urls[:MAX_IMAGES]):
                 try:
                     full_url = urljoin(BASE_URL, url)
-                    # ✅ ИСПРАВЛЕНИЕ: увеличен таймаут до 30 сек (фото медленно отдаются)
                     response = await context.request.get(full_url, timeout=30000)
                     if response.status == 200:
                         content = await response.body()
@@ -289,7 +294,6 @@ class ILeasingParser:
                                 f.write(jpeg_bytes)
                             downloaded += 1
                             
-                            # ✅ Сохраняем base64 первого фото
                             if first_base64 is None:
                                 first_base64 = base64.b64encode(jpeg_bytes).decode('ascii')
                                 logger.info(f"   ✅ Фото {i+1}: сохранено ({len(jpeg_bytes)} байт), base64 первого готов")
