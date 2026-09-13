@@ -1,4 +1,4 @@
-# parser/parser.py
+# parser/parser.py 4
 """
 Парсер каталога ileasing.ru на Playwright.
 
