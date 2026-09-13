@@ -1,4 +1,4 @@
-# modules/scheduler.py
+# modules/scheduler.py v-2
 """
 Планировщик на APScheduler.
 - publish_random_post — публикует 1 пост из listings.db (можно вызвать вручную)
@@ -93,8 +93,8 @@ def mark_listing_published(url: str):
 def download_image(url: str) -> bytes:
     """
     Скачивает фото по URL и конвертирует в JPEG при необходимости.
-    ✅ ИСПРАВЛЕНИЕ: WebP и другие форматы конвертируются в JPEG,
-       так как MAX API поддерживает только JPG/JPEG/PNG/GIF/TIFF/BMP/HEIC.
+    MAX API поддерживает только JPG/JPEG/PNG/GIF/TIFF/BMP/HEIC.
+    WebP конвертируется в JPEG [citation:1][citation:7].
     """
     try:
         logger.info(f"⬇️ Скачиваю фото: {url}")
@@ -179,7 +179,7 @@ def publish_random_post(force: bool = False):
 
     logger.info(f"📦 Выбрана карточка: {listing['title']}")
 
-    # ============ ФОТО: ДИАГНОСТИКА ============
+    # ============ ФОТО: ЗАГРУЗКА В MAX ============
     image_token = None
     image_url = listing.get("image")
     logger.info(f"🖼️ image URL из БД: {image_url!r}")
@@ -189,6 +189,7 @@ def publish_random_post(force: bool = False):
         logger.info(f"📥 Скачано байт: {len(image_bytes) if image_bytes else 0}")
 
         if image_bytes:
+            # Загружаем в MAX API и получаем токен
             image_token = _api.upload_file(image_bytes, "photo.jpg")
             logger.info(f"🎫 Токен после upload: {image_token!r}")
         else:
