@@ -1,4 +1,4 @@
-# app.py v-2
+# app.py
 from flask import Flask, request, jsonify, render_template_string, send_file
 import requests
 import logging
@@ -153,20 +153,17 @@ class APIClient:
     def upload_file(self, image_bytes, filename='image.jpg'):
         """
         Загрузка изображения в MAX API.
-        
-        Согласно документации [citation:1][citation:9]:
-        - ШАГ 1: POST /uploads?type=image → получаем url и ТОКЕН
-        - ШАГ 2: POST на полученный url → загружаем файл
-        
-        ВАЖНО: Для изображений токен приходит НА ШАГЕ 1 (в ответе на /uploads),
-        а не после загрузки файла!
+        Согласно документации :
+        - ШАГ 1: POST /uploads?type=image → url
+        - ШАГ 2: POST upload_url → загрузка файла
+        - Токен извлекается из ответа шага 2 (структура photos)
         """
         if not self.token:
             logger.error("❌ Нет токена для загрузки")
             return None
 
         try:
-            # ШАГ 1: Получаем URL для загрузки И токен
+            # ШАГ 1: Получаем URL
             logger.info(f"📤 ШАГ 1: Запрос upload URL ({len(image_bytes)} байт)")
             response = requests.post(
                 f"{self.base_url}/uploads",
@@ -188,17 +185,16 @@ class APIClient:
                 return None
 
             upload_url = upload_data.get('url')
-            # ✅ КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: для изображений токен приходит уже на шаге 1!
-            token = upload_data.get('token')
-            
+            token = upload_data.get('token')  # Может прийти уже здесь
+
             logger.info(f"📤 Получен upload_url: {upload_url}")
-            logger.info(f"📤 Получен token (шаг 1): {token[:40] if token else 'НЕТ'}...")
+            logger.info(f"📤 Токен на шаге 1: {token[:40] if token else 'НЕТ'}")
 
             if not upload_url:
                 logger.error(f"❌ Не получен URL: {upload_data}")
                 return None
 
-            # ШАГ 2: Загружаем файл по полученному URL
+            # ШАГ 2: Загружаем файл
             files = {'data': (filename, image_bytes, 'image/jpeg')}
             logger.info(f"📤 ШАГ 2: POST на {upload_url}")
 
@@ -214,20 +210,19 @@ class APIClient:
                 logger.error(f"❌ Ошибка загрузки: {upload_response.status_code} - {upload_response.text[:200]}")
                 return None
 
-            # Если токен не пришёл на шаге 1 — пробуем извлечь из ответа шага 2
+            # Если токен не пришёл на шаге 1 — пробуем шаг 2
             if not token:
                 try:
                     upload_result = upload_response.json()
                     logger.info(f"📤 ШАГ 2: JSON ответа: {upload_result}")
-                    
-                    # Для изображений может быть структура photos
+
                     if 'photos' in upload_result and isinstance(upload_result['photos'], dict):
                         for photo_key, photo_data in upload_result['photos'].items():
                             if isinstance(photo_data, dict) and 'token' in photo_data:
                                 token = photo_data['token']
                                 logger.info(f"✅ Токен найден в photos[{photo_key}]: {token[:40]}...")
                                 break
-                    
+
                     if not token and 'token' in upload_result:
                         token = upload_result['token']
                         logger.info(f"✅ Токен найден на верхнем уровне: {token[:40]}...")
@@ -451,7 +446,7 @@ ADMIN_PAGE = """
                 document.getElementById('stats').innerHTML =
                     '<div class="status-row"><span class="status-label">📦 Опубликовано</span><span class="status-value">' + d.published_total + '</span></div>' +
                     '<div class="status-row"><span class="status-label">⏳ В очереди</span><span class="status-value">' + d.pending + '</span></div>' +
-                    '<div class="status-row"><span class="status-label">📊 Всего</span><span class="status-value">' + d.listings_total + '</span></div>' +
+                    '<div class="status-row"><span class="status-label">📊 Всего в очереди</span><span class="status-value">' + d.listings_total + '</span></div>' +
                     '<div class="status-row"><span class="status-label">👤 Админ</span><span class="status-value">' + (d.admin_id || '—') + '</span></div>';
             } catch (e) {
                 document.getElementById('stats').textContent = 'Ошибка: ' + e.message;
@@ -526,24 +521,16 @@ def admin_stats():
         published_stats = db.stats()
         admin_id = get_admin_id()
 
-        listings_total = 0
-        pending = 0
+        pending_queue = 0
         try:
-            import sqlite3
-            listings_path = os.path.join(DATA_DIR, "listings.db")
-            if os.path.exists(listings_path):
-                conn = sqlite3.connect(listings_path, timeout=10)
-                conn.row_factory = sqlite3.Row
-                listings_total = conn.execute("SELECT COUNT(*) as c FROM listings").fetchone()["c"]
-                pending = conn.execute("SELECT COUNT(*) as c FROM listings WHERE status='pending'").fetchone()["c"]
-                conn.close()
+            pending_queue = db.count_pending_queue()
         except Exception as e:
-            logger.error(f"Ошибка чтения listings.db: {e}")
+            logger.error(f"Ошибка чтения pending_queue: {e}")
 
         return jsonify({
             "published_total": published_stats.get("published_total", 0),
-            "listings_total": listings_total,
-            "pending": pending,
+            "listings_total": pending_queue,
+            "pending": pending_queue,
             "admin_id": admin_id,
             "channel_id": CHANNEL_ID,
             "test_mode": os.environ.get("TEST_MODE", "false").lower() == "true",
@@ -648,10 +635,15 @@ def webhook():
             if text == '/status':
                 stats = db.stats()
                 test_mode = os.environ.get("TEST_MODE", "false").lower() == "true"
+                try:
+                    pending_q = db.count_pending_queue()
+                except Exception:
+                    pending_q = 0
                 api.send_message(
                     user_id,
                     f"📊 **Статус бота**\n\n"
                     f"📦 Опубликовано: {stats.get('published_total', 0)}\n"
+                    f"⏳ В очереди: {pending_q}\n"
                     f"📡 Канал: `{CHANNEL_ID}`\n"
                     f"🧪 Тестовый режим: {'ДА' if test_mode else 'НЕТ'}"
                 )
