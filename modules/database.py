@@ -1,4 +1,4 @@
-# bot/modules/database.py 4
+# bot/modules/database.py  - 5
 """
 SQLite-обёртка для бота-публикатора.
 Хранит:
@@ -138,6 +138,12 @@ class Database:
     # ========== ОЧЕРЕДЬ ПУБЛИКАЦИЙ ==========
 
     def sync_pending_from_listings(self, listings_path: str) -> int:
+        """
+        Копирует pending-карточки из listings.db в pending_queue.
+        
+        ✅ ИСПРАВЛЕНИЕ: пропускает карточки, которые уже опубликованы
+        (есть в таблице published) — чтобы не публиковать их заново.
+        """
         if not os.path.exists(listings_path):
             logger.warning(f"⚠️ {listings_path} не найден")
             return 0
@@ -145,6 +151,9 @@ class Database:
         src = sqlite3.connect(listings_path, timeout=10)
         src.row_factory = sqlite3.Row
         added = 0
+        skipped_published = 0
+        skipped_in_queue = 0
+
         try:
             cols = [r["name"] for r in src.execute("PRAGMA table_info(listings)").fetchall()]
             has_base64 = "image_base64" in cols
@@ -168,11 +177,29 @@ class Database:
                     WHERE status = 'pending'
                 """).fetchall()
 
-            logger.info(f"📋 Найдено pending-записей: {len(rows)}")
+            logger.info(f"📋 Найдено pending-записей в listings.db: {len(rows)}")
 
             with self._connect() as conn:
                 for row in rows:
                     r = dict(row)
+                    ext_id = r.get("external_id")
+
+                    # ✅ ПРОВЕРКА 1: уже опубликовано? — пропускаем
+                    if ext_id and conn.execute(
+                        "SELECT 1 FROM published WHERE external_id = ? LIMIT 1",
+                        (ext_id,)
+                    ).fetchone():
+                        skipped_published += 1
+                        continue
+
+                    # ✅ ПРОВЕРКА 2: уже в pending_queue? — пропускаем
+                    if ext_id and conn.execute(
+                        "SELECT 1 FROM pending_queue WHERE external_id = ? LIMIT 1",
+                        (ext_id,)
+                    ).fetchone():
+                        skipped_in_queue += 1
+                        continue
+
                     try:
                         conn.execute("""
                             INSERT OR IGNORE INTO pending_queue (
@@ -182,7 +209,7 @@ class Database:
                             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             r.get("id"),
-                            r.get("external_id"),
+                            ext_id,
                             r.get("url"),
                             r.get("title"),
                             r.get("price"),
@@ -203,7 +230,9 @@ class Database:
                         logger.warning(f"⚠️ Ошибка добавления {r.get('url')}: {e}")
                 conn.commit()
 
-            logger.info(f"✅ Синхронизировано в pending_queue: {added} новых")
+            logger.info(f"✅ Синхронизировано: добавлено {added}")
+            logger.info(f"⏭️  Пропущено (уже опубликовано): {skipped_published}")
+            logger.info(f"⏭️  Пропущено (уже в очереди): {skipped_in_queue}")
             return added
         finally:
             src.close()
