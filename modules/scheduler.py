@@ -1,9 +1,10 @@
-# modules/scheduler.py 4
+м# modules/scheduler.py
 """
 Планировщик на APScheduler.
-- publish_random_post — публикует 1 пост из pending_queue (с base64 фото)
+- publish_random_post — публикует 1 пост из pending_queue (до 3 фото)
 - cleanup_old_posts — удаляет старые посты при превышении лимита
-- refresh_listings — скачивает свежую listings.db из ветки state и синхронизирует pending_queue
+- refresh_listings — скачивает свежую listings.db из ветки state
+- apply_schedule — пересоздаёт задания по заданной частоте
 """
 
 import os
@@ -24,15 +25,15 @@ logger = logging.getLogger(__name__)
 LISTINGS_URL = "https://raw.githubusercontent.com/Gorg1969/ileasing-bot/state/data/listings.db"
 LISTINGS_PATH = "data/listings.db"
 
-POSTS_PER_DAY = 20
 MAX_POSTS_IN_CHANNEL = 2000
 CHAT_ID = None
-PUBLISH_HOURS = list(range(8, 20))
+PUBLISH_HOURS = list(range(8, 20))   # часы, в которые можно публиковать
 
 _api = None
 _db = None
 _publisher = None
 _description_gen = None
+_scheduler: BackgroundScheduler = None
 
 
 def init_scheduler(api, db, publisher, description_gen, chat_id: str):
@@ -46,18 +47,14 @@ def init_scheduler(api, db, publisher, description_gen, chat_id: str):
 
 
 def refresh_listings():
-    """
-    Скачивает listings.db из ветки state и синхронизирует pending_queue
-    в БД бота (published.db).
-    """
     logger.info("=" * 60)
     logger.info("🔄 refresh_listings: НАЧАЛО")
     logger.info(f"🔄 URL: {LISTINGS_URL}")
-    
+
     try:
         r = requests.get(LISTINGS_URL, timeout=30)
         logger.info(f"🔄 HTTP {r.status_code}, размер ответа: {len(r.content)} байт")
-        
+
         if r.status_code != 200:
             logger.error(f"❌ Не удалось скачать listings.db: HTTP {r.status_code}")
             return False
@@ -67,27 +64,33 @@ def refresh_listings():
             f.write(r.content)
         logger.info(f"✅ listings.db сохранена локально ({len(r.content)} байт)")
 
-        # Проверяем, что скачали валидный SQLite и есть ли колонка
         try:
             conn = sqlite3.connect(LISTINGS_PATH, timeout=10)
             cols = [row[1] for row in conn.execute("PRAGMA table_info(listings)").fetchall()]
             logger.info(f"📋 Колонки в скачанной БД: {cols}")
+            has_images_b64 = "images_base64" in cols
             has_b64 = "image_base64" in cols
-            logger.info(f"📋 image_base64 присутствует: {has_b64}")
-            
-            if has_b64:
+            logger.info(f"📋 images_base64: {has_images_b64}, image_base64: {has_b64}")
+
+            if has_images_b64:
+                with_b64 = conn.execute(
+                    "SELECT COUNT(*) FROM listings WHERE status='pending' AND images_base64 IS NOT NULL"
+                ).fetchone()[0]
+            elif has_b64:
                 with_b64 = conn.execute(
                     "SELECT COUNT(*) FROM listings WHERE status='pending' AND image_base64 IS NOT NULL"
                 ).fetchone()[0]
-                pending_total = conn.execute(
-                    "SELECT COUNT(*) FROM listings WHERE status='pending'"
-                ).fetchone()[0]
-                logger.info(f"📊 Pending всего: {pending_total}, из них с base64: {with_b64}")
+            else:
+                with_b64 = 0
+
+            pending_total = conn.execute(
+                "SELECT COUNT(*) FROM listings WHERE status='pending'"
+            ).fetchone()[0]
+            logger.info(f"📊 Pending всего: {pending_total}, из них с base64: {with_b64}")
             conn.close()
         except Exception as e:
             logger.error(f"❌ Ошибка проверки скачанной БД: {e}")
 
-        # ✅ Синхронизируем pending_queue в БД бота
         if _db:
             logger.info("🔄 Синхронизация pending_queue...")
             added = _db.sync_pending_from_listings(LISTINGS_PATH)
@@ -99,7 +102,7 @@ def refresh_listings():
         logger.info("🔄 refresh_listings: КОНЕЦ (успех)")
         logger.info("=" * 60)
         return True
-        
+
     except Exception as e:
         logger.error(f"❌ Ошибка refresh_listings: {e}")
         import traceback
@@ -109,55 +112,14 @@ def refresh_listings():
 
 
 def upload_image_to_max(image_base64: str) -> str:
-    """
-    Загружает изображение в MAX API из base64. Возвращает токен.
-    
-    Согласно документации MAX :
-    - ШАГ 1: POST /uploads?type=image → получаем url (и, возможно, token)
-    - ШАГ 2: POST upload_url → загружаем файл
-    - Токен для изображений приходит либо на шаге 1, либо на шаге 2
-    """
-    logger.info("=" * 60)
-    logger.info("📤 upload_image_to_max: НАЧАЛО")
-    
+    """Загружает ОДНО изображение в MAX API из base64. Возвращает токен."""
     if not image_base64:
-        logger.warning("⚠️ upload_image_to_max: пустой base64")
-        logger.info("=" * 60)
         return None
 
     try:
-        # Декодируем base64
-        logger.info(f"📤 base64 длина: {len(image_base64)} символов")
         image_bytes = base64.b64decode(image_base64)
-        logger.info(f"📤 Декодировано: {len(image_bytes)} байт")
-        
-        # Проверяем сигнатуру
-        sig = image_bytes[:12]
-        logger.info(f"📤 Первые 12 байт (hex): {sig.hex()}")
-        
-        if sig[:3] == b'\xff\xd8\xff':
-            logger.info("📤 Формат: JPEG ✅")
-        elif sig[:8] == b'\x89PNG\r\n\x1a\n':
-            logger.info("📤 Формат: PNG ✅")
-        elif sig[:4] == b'RIFF' and sig[8:12] == b'WEBP':
-            logger.error("📤 Формат: WebP ❌ (MAX не поддерживает!)")
-            logger.info("=" * 60)
-            return None
-        elif sig[:3] == b'GIF':
-            logger.info("📤 Формат: GIF ✅")
-        else:
-            logger.warning(f"📤 Формат неизвестен, hex: {sig.hex()}")
-        
-        # Проверяем размер
-        size_mb = len(image_bytes) / (1024 * 1024)
-        logger.info(f"📤 Размер: {size_mb:.2f} МБ")
-        if size_mb > 50:
-            logger.error("📤 Размер > 50 МБ — MAX отклонит")
-            logger.info("=" * 60)
-            return None
+        logger.info(f"📤 Загрузка в MAX: {len(image_bytes)} байт")
 
-        # ============ ШАГ 1: Получаем URL ============
-        logger.info(f"📤 ШАГ 1: POST {_api.base_url}/uploads?type=image")
         response = requests.post(
             f"{_api.base_url}/uploads",
             headers={"Authorization": _api.token},
@@ -165,34 +127,19 @@ def upload_image_to_max(image_base64: str) -> str:
             timeout=30,
             verify=False
         )
-        logger.info(f"📤 ШАГ 1: HTTP {response.status_code}")
-        logger.info(f"📤 ШАГ 1: тело ответа: {response.text[:500]}")
-        
+
         if response.status_code != 200:
-            logger.error(f"❌ ШАГ 1 провален: {response.status_code}")
-            logger.info("=" * 60)
-            return None
-        
-        try:
-            upload_data = response.json()
-        except ValueError:
-            logger.error(f"❌ ШАГ 1: невалидный JSON")
-            logger.info("=" * 60)
-            return None
-        
-        upload_url = upload_data.get('url')
-        token_from_step1 = upload_data.get('token')
-        
-        logger.info(f"📤 upload_url: {upload_url}")
-        logger.info(f"📤 token из шага 1: {'ЕСТЬ (' + token_from_step1[:30] + '...)' if token_from_step1 else 'НЕТ'}")
-        
-        if not upload_url:
-            logger.error(f"❌ ШАГ 1: нет url в ответе: {upload_data}")
-            logger.info("=" * 60)
+            logger.error(f"❌ Ошибка /uploads: {response.status_code} - {response.text[:200]}")
             return None
 
-        # ============ ШАГ 2: Загружаем файл ============
-        logger.info(f"📤 ШАГ 2: POST {upload_url}")
+        upload_data = response.json()
+        upload_url = upload_data.get('url')
+        token_from_step1 = upload_data.get('token')
+
+        if not upload_url:
+            logger.error(f"❌ Нет url в ответе: {upload_data}")
+            return None
+
         files = {'data': ('photo.jpg', image_bytes, 'image/jpeg')}
         upload_response = requests.post(
             upload_url,
@@ -200,112 +147,93 @@ def upload_image_to_max(image_base64: str) -> str:
             timeout=60,
             verify=False
         )
-        logger.info(f"📤 ШАГ 2: HTTP {upload_response.status_code}")
-        logger.info(f"📤 ШАГ 2: тело ответа: {upload_response.text[:500]}")
-        
+
         if upload_response.status_code != 200:
-            logger.error(f"❌ ШАГ 2 провален: {upload_response.status_code}")
-            logger.info("=" * 60)
+            logger.error(f"❌ Ошибка загрузки: {upload_response.status_code}")
             return None
 
-        # ============ ШАГ 3: Извлекаем токен ============
-        token = token_from_step1  # Если пришёл на шаге 1 — используем
-        
+        token = token_from_step1
         if not token:
-            logger.info("📤 Токен не пришёл на шаге 1, ищем в шаге 2...")
             try:
                 upload_result = upload_response.json()
-                logger.info(f"📤 JSON шага 2: {str(upload_result)[:500]}")
-                
-                # Структура photos
                 if 'photos' in upload_result and isinstance(upload_result['photos'], dict):
                     for key, photo_data in upload_result['photos'].items():
                         if isinstance(photo_data, dict) and 'token' in photo_data:
                             token = photo_data['token']
-                            logger.info(f"✅ Токен найден в photos[{key}]: {token[:40]}...")
                             break
-                
-                # Fallback: token на верхнем уровне
                 if not token and 'token' in upload_result:
                     token = upload_result['token']
-                    logger.info(f"✅ Токен найден на верхнем уровне: {token[:40]}...")
-                    
-            except ValueError as e:
-                logger.error(f"❌ Ошибка парсинга JSON шага 2: {e}")
-                logger.info("=" * 60)
+            except ValueError:
+                logger.error("❌ Невалидный JSON ответа шага 2")
                 return None
 
-        if not token:
-            logger.error("❌ Токен НЕ НАЙДЕН ни в шаге 1, ни в шаге 2")
-            logger.info("=" * 60)
-            return None
-        
-        logger.info(f"✅ upload_image_to_max: токен получен ({token[:40]}...)")
-        logger.info("=" * 60)
         return token
 
     except Exception as e:
-        logger.error(f"❌ upload_image_to_max: исключение: {e}")
-        import traceback
-        traceback.print_exc()
-        logger.info("=" * 60)
+        logger.error(f"❌ Ошибка загрузки в MAX: {e}")
         return None
 
 
+def upload_multiple_images(listing: dict) -> list:
+    """Загружает до 3 изображений из base64 и возвращает список токенов."""
+    tokens = []
+
+    # Пробуем images_base64 (новый формат — массив)
+    images_b64_json = listing.get("images_base64")
+    if images_b64_json:
+        try:
+            images_list = json.loads(images_b64_json)
+            if isinstance(images_list, list) and images_list:
+                for idx, b64 in enumerate(images_list[:3]):
+                    logger.info(f"📤 Загрузка фото {idx+1}/{len(images_list[:3])}")
+                    token = upload_image_to_max(b64)
+                    if token:
+                        tokens.append(token)
+                        logger.info(f"✅ Токен {idx+1} получен")
+                    else:
+                        logger.warning(f"⚠️ Не удалось загрузить фото {idx+1}")
+                return tokens
+        except Exception as e:
+            logger.error(f"❌ Ошибка парсинга images_base64: {e}")
+
+    # Fallback: одно фото
+    single_b64 = listing.get("image_base64")
+    if single_b64:
+        logger.info("📤 Fallback: загрузка одного фото")
+        token = upload_image_to_max(single_b64)
+        if token:
+            tokens.append(token)
+
+    return tokens
+
+
 def publish_random_post(force: bool = False):
-    """
-    Публикует один случайный пост из pending_queue.
-    Использует base64 фото из БД бота → загружает в MAX → публикует.
-    """
     logger.info("=" * 60)
     logger.info(f"📤 publish_random_post: НАЧАЛО (force={force})")
-    
-    # Обновляем очередь
+
     refresh_listings()
 
-    # Берём из pending_queue
     listing = _db.get_random_pending()
     if not listing:
-        logger.warning("⚠️ pending_queue пуста — нет карточек для публикации")
+        logger.warning("⚠️ pending_queue пуста")
         logger.info("=" * 60)
         return
 
-    logger.info(f"📦 Выбрана карточка:")
-    logger.info(f"   ID: {listing.get('id')}")
-    logger.info(f"   external_id: {listing.get('external_id')}")
-    logger.info(f"   title: {listing.get('title')}")
-    logger.info(f"   url: {listing.get('url')}")
-    logger.info(f"   price: {listing.get('price')}")
+    logger.info(f"📦 Выбрана карточка: {listing.get('title')}")
 
-    # ============ ФОТО ИЗ BASE64 ============
+    # ============ ЗАГРУЗКА ФОТО (до 3) ============
     logger.info("-" * 60)
-    logger.info("🖼️ ЭТАП: ЗАГРУЗКА ФОТО")
-    logger.info("-" * 60)
-    
-    image_token = None
-    image_base64 = listing.get("image_base64")
-
-    if image_base64:
-        logger.info(f"🖼️ base64 найден в БД: {len(image_base64)} символов")
-        image_token = upload_image_to_max(image_base64)
-        logger.info(f"🎫 Результат upload: image_token={'ЕСТЬ (' + image_token[:30] + '...)' if image_token else 'НЕТ'}")
-    else:
-        logger.warning("⚠️ В очереди нет base64 для этой карточки")
-        logger.warning("   Возможные причины:")
-        logger.warning("   1. Парсер не запускался с новым кодом")
-        logger.warning("   2. В listings.db нет колонки image_base64")
-        logger.warning("   3. Карточка добавлена до обновления парсера")
-
-    logger.info(f"🧪 ИТОГ ФОТО: image_token={'ЕСТЬ' if image_token else 'НЕТ'}")
+    logger.info("🖼️ ЭТАП: ЗАГРУЗКА ФОТО (до 3)")
     logger.info("-" * 60)
 
-    # ============ ГЕНЕРАЦИЯ ТЕКСТА ============
-    logger.info("📝 ЭТАП: ГЕНЕРАЦИЯ ТЕКСТА")
+    image_tokens = upload_multiple_images(listing)
+    logger.info(f"🧪 Итог: получено токенов {len(image_tokens)}")
+    logger.info("-" * 60)
+
+    # ============ ТЕКСТ ============
     post_text = _description_gen.generate_post(listing)
-    logger.info(f"📝 Текст поста ({len(post_text)} символов):")
-    logger.info(f"---\n{post_text}\n---")
 
-    # ============ TEST_MODE ============
+    # ============ TEST_MODE / БОЕВОЙ ============
     test_mode = os.environ.get("TEST_MODE", "false").lower() == "true"
     target_chat = CHAT_ID
 
@@ -317,7 +245,7 @@ def publish_random_post(force: bool = False):
                     target_chat = f.read().strip()
                 logger.info(f"🧪 TEST_MODE: публикация в личку {target_chat}")
             else:
-                logger.error("❌ TEST_MODE включён, но admin_id не задан")
+                logger.error("❌ TEST_MODE, но admin_id не задан")
                 logger.info("=" * 60)
                 return
         except Exception as e:
@@ -325,17 +253,12 @@ def publish_random_post(force: bool = False):
             logger.info("=" * 60)
             return
     else:
-        logger.info(f"🔴 БОЕВОЙ РЕЖИМ: публикация в канал {target_chat}")
+        logger.info(f"🔴 БОЕВОЙ РЕЖИМ: публикация в {target_chat}")
 
     # ============ ПУБЛИКАЦИЯ ============
-    logger.info("-" * 60)
-    logger.info("📤 ЭТАП: ОТПРАВКА В MAX")
-    logger.info("-" * 60)
-    
-    if image_token:
-        logger.info(f"📤 Отправка С ФОТО в {target_chat}")
-        logger.info(f"📤 attachments: [{{type: image, payload: {{token: {image_token[:30]}...}}}}]")
-        ok = _api.send_message_with_attachments(target_chat, post_text, [image_token])
+    if image_tokens:
+        logger.info(f"📤 Отправка С ФОТО ({len(image_tokens)} шт.) в {target_chat}")
+        ok = _api.send_message_with_attachments(target_chat, post_text, image_tokens)
     else:
         logger.info(f"📤 Отправка БЕЗ фото в {target_chat}")
         if test_mode:
@@ -343,15 +266,10 @@ def publish_random_post(force: bool = False):
         else:
             ok = _api.send_message_to_chat(target_chat, post_text)
 
-    logger.info(f"📤 Результат отправки: {'✅ OK' if ok else '❌ FAIL'}")
+    logger.info(f"📤 Результат: {'✅ OK' if ok else '❌ FAIL'}")
 
     # ============ ПОСТ-ОБРАБОТКА ============
     if ok:
-        logger.info("-" * 60)
-        logger.info("💾 ЭТАП: СОХРАНЕНИЕ В БД")
-        logger.info("-" * 60)
-        
-        # Сначала добавляем в published
         try:
             _db.add_publication(
                 listing_id=listing.get("listing_id") or listing.get("id") or 0,
@@ -361,22 +279,18 @@ def publish_random_post(force: bool = False):
                 message_id="",
                 chat_id=target_chat,
             )
-            logger.info("✅ Запись в published добавлена")
         except Exception as e:
-            logger.warning(f"⚠️ Ошибка add_publication: {e}")
+            logger.warning(f"⚠️ add_publication: {e}")
 
-        # Потом удаляем из очереди
         try:
             _db.remove_from_pending(listing["external_id"])
-            logger.info(f"✅ Удалено из pending_queue: {listing['external_id']}")
+            logger.info(f"✅ Удалено из pending_queue")
         except Exception as e:
-            logger.error(f"❌ Ошибка remove_from_pending: {e}")
-        
+            logger.error(f"❌ remove_from_pending: {e}")
+
         logger.info(f"✅ ОПУБЛИКОВАНО: {listing['title']}")
     else:
         logger.error(f"❌ НЕ УДАЛОСЬ ОПУБЛИКОВАТЬ: {listing['title']}")
-        logger.error(f"   image_token: {image_token}")
-        logger.error(f"   target_chat: {target_chat}")
 
     logger.info("=" * 60)
     logger.info("📤 publish_random_post: КОНЕЦ")
@@ -384,79 +298,108 @@ def publish_random_post(force: bool = False):
 
 
 def cleanup_old_posts():
-    logger.info("=" * 60)
     logger.info("🗑️ cleanup_old_posts: НАЧАЛО")
-    
     total = _db.count_published()
-    logger.info(f"📊 Всего постов в канале (по БД): {total}")
+    logger.info(f"📊 Всего постов: {total}")
 
     if total <= MAX_POSTS_IN_CHANNEL:
         logger.info(f"✅ Лимит не превышен ({total}/{MAX_POSTS_IN_CHANNEL})")
-        logger.info("=" * 60)
         return
 
     excess = total - MAX_POSTS_IN_CHANNEL
-    logger.info(f"🗑️ Нужно удалить: {excess} постов")
-
     old_posts = _db.get_oldest_published(limit=excess)
-    logger.info(f"🗑️ Получено записей для удаления: {len(old_posts)}")
 
-    for i, post in enumerate(old_posts):
-        logger.info(f"🗑️ [{i+1}/{len(old_posts)}] Пост: {post.get('title')}")
+    for post in old_posts:
         message_id = post.get("message_id")
-        
         if not message_id:
-            logger.warning(f"   ⚠️ Нет message_id — помечаю как deleted")
             _db.mark_deleted(post["id"])
             continue
 
-        logger.info(f"   📤 DELETE /messages?message_id={message_id}")
         success = _api.delete_message(message_id)
-        
         if success:
-            logger.info(f"   ✅ Удалено")
             _db.mark_deleted(post["id"])
-        else:
-            logger.error(f"   ❌ Не удалось удалить")
-            try:
-                admin_file = os.path.join(os.environ.get("DATA_DIR", "/app/data"), "admin_id.txt")
-                if os.path.exists(admin_file):
-                    with open(admin_file) as f:
-                        admin_id = f.read().strip()
-                    _api.send_message(
-                        int(admin_id),
-                        f"⚠️ **Не удалось удалить пост автоматически.**\n"
-                        f"ID: `{message_id}`\n"
-                        f"Название: {post.get('title')}\n"
-                        f"Удалите вручную."
-                    )
-            except Exception as e:
-                logger.error(f"❌ Не удалось уведомить админа: {e}")
-
         time.sleep(0.6)
 
     logger.info("🗑️ cleanup_old_posts: КОНЕЦ")
-    logger.info("=" * 60)
+
+
+def apply_schedule(posts_per_day: int):
+    """
+    Пересоздаёт задания публикации согласно частоте.
+    
+    - posts_per_day = 1..12 → по одному посту в случайные часы из PUBLISH_HOURS
+    - posts_per_day = 13..24 → по 2 поста в час (12 часов × 2 = 24)
+    - posts_per_day = 25..36 → по 3 поста в час
+    - и т.д.
+    """
+    global _scheduler
+    if _scheduler is None:
+        logger.error("❌ Планировщик не инициализирован")
+        return
+
+    # Удаляем старые задачи публикации
+    for job in _scheduler.get_jobs():
+        if job.id.startswith("publish_"):
+            _scheduler.remove_job(job.id)
+
+    posts_per_day = max(1, min(int(posts_per_day), 48))
+    hours = PUBLISH_HOURS  # 8..19 (12 часов)
+    num_hours = len(hours)
+
+    # Сколько постов на каждый час
+    per_hour = posts_per_day / num_hours
+    total_scheduled = 0
+
+    random.seed()
+    for hour in hours:
+        count = per_hour
+        # Распределяем равномерно
+        if per_hour < 1:
+            # Меньше 1 на час — публикуем только в случайные часы
+            if random.random() < per_hour:
+                count = 1
+            else:
+                count = 0
+        else:
+            count = int(per_hour)
+            if random.random() < (per_hour - count):
+                count += 1
+
+        # Ограничение — не больше 4 постов в час
+        count = min(count, 4)
+
+        minutes_used = set()
+        for i in range(count):
+            # Случайная уникальная минута в часе
+            for _ in range(10):
+                minute = random.randint(0, 59)
+                if minute not in minutes_used:
+                    break
+            minutes_used.add(minute)
+
+            _scheduler.add_job(
+                publish_random_post,
+                CronTrigger(hour=hour, minute=minute),
+                id=f"publish_{hour}_{i}",
+                replace_existing=True,
+            )
+            total_scheduled += 1
+            logger.info(f"⏰ Публикация #{total_scheduled}: {hour:02d}:{minute:02d} МСК")
+
+    logger.info(f"✅ Расписание обновлено: {total_scheduled} публикаций/день")
 
 
 def start_scheduler():
-    logger.info("=" * 60)
+    global _scheduler
     logger.info("⏰ start_scheduler: НАЧАЛО")
-    
-    scheduler = BackgroundScheduler(timezone="Europe/Moscow")
 
-    random.seed()
-    for hour in PUBLISH_HOURS:
-        minute = random.randint(0, 59)
-        scheduler.add_job(
-            publish_random_post,
-            CronTrigger(hour=hour, minute=minute),
-            id=f"publish_{hour}",
-            replace_existing=True,
-        )
-        logger.info(f"⏰ Публикация запланирована на {hour:02d}:{minute:02d} МСК")
+    _scheduler = BackgroundScheduler(timezone="Europe/Moscow")
 
-    scheduler.add_job(
+    # Расписание по умолчанию
+    posts_per_day = _db.get_posts_per_day() if _db else 20
+    apply_schedule(posts_per_day)
+
+    _scheduler.add_job(
         refresh_listings,
         CronTrigger(minute=0),
         id="refresh_listings",
@@ -464,7 +407,7 @@ def start_scheduler():
     )
     logger.info("⏰ refresh_listings: каждый час в :00")
 
-    scheduler.add_job(
+    _scheduler.add_job(
         cleanup_old_posts,
         CronTrigger(hour=3, minute=0),
         id="cleanup_old_posts",
@@ -472,7 +415,7 @@ def start_scheduler():
     )
     logger.info("⏰ cleanup_old_posts: ежедневно в 03:00 МСК")
 
-    scheduler.start()
+    _scheduler.start()
     logger.info("✅ Планировщик запущен")
     logger.info("=" * 60)
-    return scheduler
+    return _scheduler
