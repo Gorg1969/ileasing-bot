@@ -1,7 +1,7 @@
 # parser/database.py
 """
 SQLite-обёртка для парсера.
-Хранит только listings (спарсенные карточки).
+Хранит только listings (спарсенные карточки) + base64 изображения.
 """
 
 import sqlite3
@@ -42,6 +42,7 @@ class ParserDB:
                     seats TEXT,
                     image TEXT,
                     images_path TEXT,
+                    image_base64 TEXT,
                     category TEXT,
                     parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     status TEXT DEFAULT 'pending'
@@ -78,6 +79,7 @@ class ParserDB:
         seats: str = None,
         image: str = None,
         images_path: str = None,
+        image_base64: str = None,
         category: str = None,
     ) -> bool:
         try:
@@ -87,12 +89,12 @@ class ParserDB:
                     INSERT INTO listings (
                         external_id, url, title, price, price_value, leasing,
                         engine, transmission, power, volume, drive, seats,
-                        image, images_path, category, status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                        image, images_path, image_base64, category, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
                 """, (
                     external_id, url, title, price, price_value, leasing,
                     engine, transmission, power, volume, drive, seats,
-                    image, images_path, category,
+                    image, images_path, image_base64, category,
                 ))
                 conn.commit()
                 return True
