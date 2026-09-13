@@ -1,4 +1,4 @@
-# parser/parser.py 4
+# parser/parser.py
 """
 Парсер каталога ileasing.ru на Playwright.
 
@@ -7,7 +7,7 @@
 2. Обходит страницы каталога (?PAGEN_1=N), собирает карточки.
 3. Фильтрует: цена >= MIN_PRICE, href ещё нет в БД.
 4. Для новых карточек: заходит в карточку, скачивает ВСЕ фото через браузер.
-5. Сохраняет: listings.db + data/images/{external_id}/*.jpg + base64 первого фото.
+5. Сохраняет: listings.db + data/images/{external_id}/*.jpg + base64 первых 3 фото.
 6. Цель — 20 новых карточек за запуск. Лимит — 5 категорий, 10 страниц на категорию.
 """
 
@@ -30,9 +30,10 @@ BASE_URL = "https://www.ileasing.ru"
 MIN_PRICE = 2_200_000
 TARGET_NEW = 20
 MAX_CATEGORIES = 5
-MAX_PAGES_PER_CATEGORY = 10   # ✅ ЗАЩИТА: не больше 10 страниц на категорию
+MAX_PAGES_PER_CATEGORY = 10
 IMAGES_DIR = "data/images"
 MAX_IMAGES = 10
+MAX_BASE64_IMAGES = 3   # ✅ храним base64 только первых 3 фото
 
 ALLOWED_CATEGORIES = [
     "/catalog/car/sedan/",
@@ -117,7 +118,7 @@ class ILeasingParser:
                     "Chrome/122.0.0.0 Safari/537.36"
                 ),
                 viewport={"width": 1440, "height": 900},
-                ignore_https_errors=True,   # ✅ игнорируем ошибки SSL (сертификат Минцифры)
+                ignore_https_errors=True,
             )
             page = await context.new_page()
 
@@ -148,7 +149,6 @@ class ILeasingParser:
 
     async def _process_category(self, context, page: Page, category: str, stats: dict):
         page_num = 1
-        # ✅ ЗАЩИТА: не больше MAX_PAGES_PER_CATEGORY страниц на категорию
         while stats["added"] < TARGET_NEW and page_num <= MAX_PAGES_PER_CATEGORY:
             url = f"{BASE_URL}{category}?PAGEN_1={page_num}"
             logger.info(f"   📄 Страница {page_num}/{MAX_PAGES_PER_CATEGORY}: {url}")
@@ -190,8 +190,8 @@ class ILeasingParser:
                     stats["skipped_dup"] += 1
                     continue
 
-                # Скачиваем фото, получаем base64 первого
-                images_count, first_base64 = await self._download_images_for_listing(
+                # Скачиваем фото, получаем base64 первых N
+                images_count, images_base64_list = await self._download_images_for_listing(
                     context, data["external_id"], data["href"]
                 )
                 stats["images_downloaded"] += images_count
@@ -200,6 +200,10 @@ class ILeasingParser:
                     f"data/images/{data['external_id']}/{i+1}.jpg"
                     for i in range(images_count)
                 ])
+
+                # base64 первого фото отдельно (для совместимости) + массив
+                first_base64 = images_base64_list[0] if images_base64_list else None
+                images_base64_json = json.dumps(images_base64_list) if images_base64_list else None
 
                 self.db.add_listing(
                     external_id=data["external_id"],
@@ -217,10 +221,14 @@ class ILeasingParser:
                     image=data["image"],
                     images_path=images_path,
                     image_base64=first_base64,
+                    images_base64=images_base64_json,
                     category=category,
                 )
                 stats["added"] += 1
-                logger.info(f"   ✅ [{stats['added']}/{TARGET_NEW}] {data['title']} — {data['price_text']} ({images_count} фото, base64={'ЕСТЬ' if first_base64 else 'НЕТ'})")
+                logger.info(
+                    f"   ✅ [{stats['added']}/{TARGET_NEW}] {data['title']} — "
+                    f"{data['price_text']} ({images_count} фото, base64={len(images_base64_list)} шт.)"
+                )
 
             page_num += 1
 
@@ -230,10 +238,11 @@ class ILeasingParser:
     async def _download_images_for_listing(self, context, external_id: str, card_url: str):
         """
         Открывает карточку товара, собирает все фото из галереи,
-        конвертирует в JPEG, сохраняет в файлы и возвращает base64 первого.
+        конвертирует в JPEG, сохраняет в файлы.
+        Возвращает base64 первых MAX_BASE64_IMAGES фото.
         
         Returns:
-            (downloaded_count: int, first_image_base64: str | None)
+            (downloaded_count: int, images_base64_list: list[str])
         """
         save_dir = os.path.join(IMAGES_DIR, external_id)
         os.makedirs(save_dir, exist_ok=True)
@@ -247,7 +256,7 @@ class ILeasingParser:
                 await page.wait_for_selector("a.l-catalog-card__gallery-item", timeout=10000)
             except PWTimeoutError:
                 logger.warning(f"   ⚠️ Галерея не найдена в карточке")
-                return 0, None
+                return 0, []
 
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2000)
@@ -267,8 +276,8 @@ class ILeasingParser:
             logger.info(f"   📸 Найдено {len(photo_urls)} фото в галерее")
 
             downloaded = 0
-            first_base64 = None
-            
+            images_base64_list = []
+
             for i, url in enumerate(photo_urls[:MAX_IMAGES]):
                 try:
                     full_url = urljoin(BASE_URL, url)
@@ -293,18 +302,23 @@ class ILeasingParser:
                             with open(filepath, "wb") as f:
                                 f.write(jpeg_bytes)
                             downloaded += 1
-                            
-                            if first_base64 is None:
-                                first_base64 = base64.b64encode(jpeg_bytes).decode('ascii')
-                                logger.info(f"   ✅ Фото {i+1}: сохранено ({len(jpeg_bytes)} байт), base64 первого готов")
+
+                            # ✅ Сохраняем base64 первых MAX_BASE64_IMAGES фото
+                            if len(images_base64_list) < MAX_BASE64_IMAGES:
+                                b64 = base64.b64encode(jpeg_bytes).decode('ascii')
+                                images_base64_list.append(b64)
+                                logger.info(
+                                    f"   ✅ Фото {i+1}: сохранено ({len(jpeg_bytes)} байт), "
+                                    f"base64 #{len(images_base64_list)}/{MAX_BASE64_IMAGES}"
+                                )
                 except Exception as e:
                     logger.warning(f"   ⚠️ Ошибка скачивания фото {i+1}: {e}")
 
-            return downloaded, first_base64
+            return downloaded, images_base64_list
 
         except Exception as e:
             logger.error(f"   ❌ Ошибка в карточке {card_url}: {e}")
-            return 0, None
+            return 0, []
         finally:
             await page.close()
 
