@@ -51,7 +51,33 @@ class ParserDB:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON listings(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_url ON listings(url)")
             conn.commit()
+
+            # ✅ МИГРАЦИЯ: добавляем недостающие колонки в существующую БД
+            self._migrate(conn)
+
             logger.info(f"✅ БД парсера инициализирована: {self.db_path}")
+
+    def _migrate(self, conn):
+        """Добавляет недостающие колонки в существующую таблицу listings."""
+        try:
+            cols = [r["name"] for r in conn.execute("PRAGMA table_info(listings)").fetchall()]
+            logger.info(f"📋 Текущие колонки listings: {cols}")
+
+            if "image_base64" not in cols:
+                logger.info("🔧 Добавляю колонку image_base64...")
+                conn.execute("ALTER TABLE listings ADD COLUMN image_base64 TEXT")
+                conn.commit()
+                logger.info("✅ Колонка image_base64 добавлена")
+            else:
+                logger.info("✅ Колонка image_base64 уже присутствует")
+
+            if "images_path" not in cols:
+                logger.info("🔧 Добавляю колонку images_path...")
+                conn.execute("ALTER TABLE listings ADD COLUMN images_path TEXT")
+                conn.commit()
+                logger.info("✅ Колонка images_path добавлена")
+        except Exception as e:
+            logger.error(f"❌ Ошибка миграции: {e}")
 
     def listing_exists(self, url: str) -> bool:
         conn = self._connect()
