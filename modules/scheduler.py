@@ -1,4 +1,4 @@
-# modules/scheduler.py
+# modules/scheduler.py 3
 """
 Планировщик на APScheduler.
 - publish_random_post — публикует 1 пост из pending_queue (с base64 фото)
