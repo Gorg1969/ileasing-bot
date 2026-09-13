@@ -7,6 +7,7 @@
 """
 
 import os
+import io
 import random
 import logging
 import sqlite3
@@ -90,7 +91,11 @@ def mark_listing_published(url: str):
 
 
 def download_image(url: str) -> bytes:
-    """Скачивает фото по URL с заголовками браузера и диагностикой формата."""
+    """
+    Скачивает фото по URL и конвертирует в JPEG при необходимости.
+    ✅ ИСПРАВЛЕНИЕ: WebP и другие форматы конвертируются в JPEG,
+       так как MAX API поддерживает только JPG/JPEG/PNG/GIF/TIFF/BMP/HEIC.
+    """
     try:
         logger.info(f"⬇️ Скачиваю фото: {url}")
         headers = {
@@ -108,26 +113,51 @@ def download_image(url: str) -> bytes:
         content_type = r.headers.get("Content-Type", "неизвестно")
         logger.info(f"⬇️ HTTP {r.status_code}, Content-Type: {content_type}, размер: {len(r.content)} байт")
 
-        if r.content and len(r.content) >= 12:
-            logger.info(f"⬇️ Первые 12 байт (hex): {r.content[:12].hex()}")
+        if r.status_code != 200 or not r.content:
+            logger.warning(f"⚠️ Фото {url}: HTTP {r.status_code}")
+            return None
 
-            # Определяем формат по сигнатуре
-            sig = r.content[:12]
-            if sig[:3] == b'\xff\xd8\xff':
-                logger.info("✅ Формат: JPEG")
-            elif sig[:4] == b'RIFF' and sig[8:12] == b'WEBP':
-                logger.warning("⚠️ Формат: WebP (MAX его не принимает!)")
-            elif sig[:8] == b'\x89PNG\r\n\x1a\n':
-                logger.info("✅ Формат: PNG")
-            elif sig[:3] == b'GIF':
-                logger.info("✅ Формат: GIF")
-            else:
-                logger.warning(f"⚠️ Неизвестный формат, первые байты: {sig.hex()}")
+        sig = r.content[:12]
+        logger.info(f"⬇️ Первые 12 байт (hex): {sig.hex()}")
 
-        if r.status_code == 200:
+        if sig[:3] == b'\xff\xd8\xff':
+            logger.info("✅ Формат: JPEG")
             return r.content
-        logger.warning(f"⚠️ Фото {url}: HTTP {r.status_code}")
-        return None
+        elif sig[:4] == b'RIFF' and sig[8:12] == b'WEBP':
+            logger.warning("⚠️ Формат: WebP → конвертирую в JPEG")
+            try:
+                from PIL import Image
+                img = Image.open(io.BytesIO(r.content))
+                if img.mode in ('RGBA', 'P'):
+                    img = img.convert('RGB')
+                output = io.BytesIO()
+                img.save(output, format='JPEG', quality=85)
+                jpeg_bytes = output.getvalue()
+                logger.info(f"✅ WebP→JPEG: {len(jpeg_bytes)} байт")
+                return jpeg_bytes
+            except Exception as e:
+                logger.error(f"❌ Ошибка конвертации WebP: {e}")
+                return None
+        elif sig[:8] == b'\x89PNG\r\n\x1a\n':
+            logger.info("✅ Формат: PNG")
+            return r.content
+        elif sig[:3] == b'GIF':
+            logger.info("✅ Формат: GIF")
+            return r.content
+        else:
+            logger.warning(f"⚠️ Неизвестный формат, пробую конвертировать...")
+            try:
+                from PIL import Image
+                img = Image.open(io.BytesIO(r.content))
+                if img.mode in ('RGBA', 'P'):
+                    img = img.convert('RGB')
+                output = io.BytesIO()
+                img.save(output, format='JPEG', quality=85)
+                return output.getvalue()
+            except Exception as e:
+                logger.error(f"❌ Не удалось конвертировать: {e}")
+                return None
+
     except Exception as e:
         logger.error(f"❌ Ошибка скачивания фото {url}: {e}")
         return None
