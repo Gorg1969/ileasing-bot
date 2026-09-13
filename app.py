@@ -1,4 +1,4 @@
-# app.py
+# app.py v-2
 from flask import Flask, request, jsonify, render_template_string, send_file
 import requests
 import logging
@@ -106,7 +106,6 @@ class APIClient:
             return False
         try:
             payload = {"text": text, "format": "markdown"}
-            # ✅ ИСПРАВЛЕНИЕ: chat_id передаём в query-параметрах
             response = requests.post(
                 f"{self.base_url}/messages",
                 headers={"Authorization": self.token, "Content-Type": "application/json"},
@@ -134,7 +133,6 @@ class APIClient:
                 "attachments": attachments
             }
             logger.info(f"📤 send_message_with_attachments: chat_id={chat_id}, tokens={tokens}")
-            # ✅ ИСПРАВЛЕНИЕ: chat_id в query-параметрах, а не в теле
             response = requests.post(
                 f"{self.base_url}/messages",
                 headers={"Authorization": self.token, "Content-Type": "application/json"},
@@ -153,12 +151,22 @@ class APIClient:
             return False
 
     def upload_file(self, image_bytes, filename='image.jpg'):
+        """
+        Загрузка изображения в MAX API.
+        
+        Согласно документации [citation:1][citation:9]:
+        - ШАГ 1: POST /uploads?type=image → получаем url и ТОКЕН
+        - ШАГ 2: POST на полученный url → загружаем файл
+        
+        ВАЖНО: Для изображений токен приходит НА ШАГЕ 1 (в ответе на /uploads),
+        а не после загрузки файла!
+        """
         if not self.token:
             logger.error("❌ Нет токена для загрузки")
             return None
 
         try:
-            # ШАГ 1: Получаем URL для загрузки
+            # ШАГ 1: Получаем URL для загрузки И токен
             logger.info(f"📤 ШАГ 1: Запрос upload URL ({len(image_bytes)} байт)")
             response = requests.post(
                 f"{self.base_url}/uploads",
@@ -167,10 +175,10 @@ class APIClient:
                 timeout=30,
                 verify=False
             )
-            logger.info(f"📤 ШАГ 1: HTTP {response.status_code}, ответ: {response.text[:300]}")
+            logger.info(f"📤 ШАГ 1: HTTP {response.status_code}, ответ: {response.text[:500]}")
 
             if response.status_code != 200:
-                logger.error(f"❌ Ошибка получения URL: {response.status_code} - {response.text[:200]}")
+                logger.error(f"❌ Ошибка получения URL: {response.status_code} - {response.text[:300]}")
                 return None
 
             try:
@@ -180,13 +188,17 @@ class APIClient:
                 return None
 
             upload_url = upload_data.get('url')
+            # ✅ КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: для изображений токен приходит уже на шаге 1!
+            token = upload_data.get('token')
+            
             logger.info(f"📤 Получен upload_url: {upload_url}")
+            logger.info(f"📤 Получен token (шаг 1): {token[:40] if token else 'НЕТ'}...")
 
             if not upload_url:
                 logger.error(f"❌ Не получен URL: {upload_data}")
                 return None
 
-            # ШАГ 2: Загружаем файл
+            # ШАГ 2: Загружаем файл по полученному URL
             files = {'data': (filename, image_bytes, 'image/jpeg')}
             logger.info(f"📤 ШАГ 2: POST на {upload_url}")
 
@@ -202,33 +214,31 @@ class APIClient:
                 logger.error(f"❌ Ошибка загрузки: {upload_response.status_code} - {upload_response.text[:200]}")
                 return None
 
-            try:
-                upload_result = upload_response.json()
-            except ValueError:
-                logger.error(f"❌ Невалидный JSON в ответе: {upload_response.text[:200]}")
-                return None
-
-            logger.info(f"📤 ШАГ 2: JSON ответа: {upload_result}")
-
-            # ✅ ИСПРАВЛЕНИЕ: Для изображений токен лежит в структуре photos
-            token = None
-            if 'photos' in upload_result and isinstance(upload_result['photos'], dict):
-                for photo_key, photo_data in upload_result['photos'].items():
-                    if isinstance(photo_data, dict) and 'token' in photo_data:
-                        token = photo_data['token']
-                        logger.info(f"✅ Токен найден в photos[{photo_key}]: {token[:30]}...")
-                        break
-
-            # Fallback: token может быть на верхнем уровне
-            if not token and 'token' in upload_result:
-                token = upload_result['token']
-                logger.info(f"✅ Токен найден на верхнем уровне: {token[:30]}...")
+            # Если токен не пришёл на шаге 1 — пробуем извлечь из ответа шага 2
+            if not token:
+                try:
+                    upload_result = upload_response.json()
+                    logger.info(f"📤 ШАГ 2: JSON ответа: {upload_result}")
+                    
+                    # Для изображений может быть структура photos
+                    if 'photos' in upload_result and isinstance(upload_result['photos'], dict):
+                        for photo_key, photo_data in upload_result['photos'].items():
+                            if isinstance(photo_data, dict) and 'token' in photo_data:
+                                token = photo_data['token']
+                                logger.info(f"✅ Токен найден в photos[{photo_key}]: {token[:40]}...")
+                                break
+                    
+                    if not token and 'token' in upload_result:
+                        token = upload_result['token']
+                        logger.info(f"✅ Токен найден на верхнем уровне: {token[:40]}...")
+                except ValueError:
+                    logger.warning(f"⚠️ Не удалось распарсить JSON шага 2: {upload_response.text[:200]}")
 
             if not token:
-                logger.error(f"❌ Токен не найден в ответе: {upload_result}")
+                logger.error(f"❌ Токен не найден ни на шаге 1, ни на шаге 2")
                 return None
 
-            logger.info(f"✅ Файл загружен, токен: {token[:30]}...")
+            logger.info(f"✅ Файл загружен, токен: {token[:40]}...")
             return token
 
         except Exception as e:
