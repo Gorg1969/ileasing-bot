@@ -1,4 +1,4 @@
-# modules/scheduler.py   4
+# modules/scheduler.py v-5
 """
 Планировщик на APScheduler.
 - publish_random_post — публикует 1 пост из pending_queue (до 3 фото)
@@ -16,6 +16,7 @@ import random
 import logging
 import sqlite3
 import time
+import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -36,6 +37,11 @@ _publisher = None
 _description_gen = None
 _scheduler: BackgroundScheduler = None
 
+# ✅ Блокировки от параллельных запусков
+_publish_lock = threading.Lock()
+_refresh_lock = threading.Lock()
+_scheduler_started = False
+
 
 def init_scheduler(api, db, publisher, description_gen, chat_id: str):
     global _api, _db, _publisher, _description_gen, CHAT_ID
@@ -48,17 +54,13 @@ def init_scheduler(api, db, publisher, description_gen, chat_id: str):
 
 
 def _ensure_fresh_queue():
-    """
-    ✅ АВТООЧИСТКА: удаляет из pending_queue записи без images_base64.
-    Нужно после обновления схемы (раньше хранилось 1 фото, теперь — до 3).
-    """
+    """Удаляет из pending_queue записи без images_base64."""
     if _db is None:
         logger.warning("⚠️ _db не инициализирован — пропускаю очистку")
         return
 
     try:
         with _db._connect() as conn:
-            # Считаем всего и без images_base64
             total = conn.execute("SELECT COUNT(*) FROM pending_queue").fetchone()[0]
             old_count = conn.execute(
                 "SELECT COUNT(*) FROM pending_queue WHERE images_base64 IS NULL OR images_base64 = ''"
@@ -80,6 +82,17 @@ def _ensure_fresh_queue():
 
 
 def refresh_listings():
+    """Скачивает listings.db и синхронизирует pending_queue. Защищён блокировкой."""
+    if not _refresh_lock.acquire(blocking=False):
+        logger.warning("⚠️ refresh_listings уже выполняется — пропускаю")
+        return False
+    try:
+        return _refresh_listings_impl()
+    finally:
+        _refresh_lock.release()
+
+
+def _refresh_listings_impl():
     logger.info("=" * 60)
     logger.info("🔄 refresh_listings: НАЧАЛО")
     logger.info(f"🔄 URL: {LISTINGS_URL}")
@@ -100,7 +113,6 @@ def refresh_listings():
         try:
             conn = sqlite3.connect(LISTINGS_PATH, timeout=10)
             cols = [row[1] for row in conn.execute("PRAGMA table_info(listings)").fetchall()]
-            logger.info(f"📋 Колонки в скачанной БД: {cols}")
             has_images_b64 = "images_base64" in cols
             has_b64 = "image_base64" in cols
             logger.info(f"📋 images_base64: {has_images_b64}, image_base64: {has_b64}")
@@ -129,8 +141,6 @@ def refresh_listings():
             added = _db.sync_pending_from_listings(LISTINGS_PATH)
             logger.info(f"✅ В pending_queue добавлено: {added}")
             logger.info(f"📊 Всего в pending_queue: {_db.count_pending_queue()}")
-        else:
-            logger.warning("⚠️ _db не инициализирован, синхронизация пропущена")
 
         logger.info("🔄 refresh_listings: КОНЕЦ (успех)")
         logger.info("=" * 60)
@@ -241,6 +251,19 @@ def upload_multiple_images(listing: dict) -> list:
 
 
 def publish_random_post(force: bool = False):
+    """
+    Публикует один пост. Защищён блокировкой — не может выполняться дважды параллельно.
+    """
+    if not _publish_lock.acquire(blocking=False):
+        logger.warning("⚠️ publish_random_post уже выполняется — пропускаю (защита от дублей)")
+        return
+    try:
+        _publish_random_post_impl(force)
+    finally:
+        _publish_lock.release()
+
+
+def _publish_random_post_impl(force: bool = False):
     logger.info("=" * 60)
     logger.info(f"📤 publish_random_post: НАЧАЛО (force={force})")
 
@@ -399,10 +422,16 @@ def apply_schedule(posts_per_day: int):
 
 
 def start_scheduler():
-    global _scheduler
+    """Запускает планировщик. Защищён от повторного запуска."""
+    global _scheduler, _scheduler_started
+
+    # ✅ Защита от повторного запуска (если start_scheduler вызовется дважды)
+    if _scheduler_started:
+        logger.warning("⚠️ Планировщик уже запущен — повторный запуск пропущен")
+        return _scheduler
+
     logger.info("⏰ start_scheduler: НАЧАЛО")
 
-    # ✅ АВТООЧИСТКА: удаляем старые записи без images_base64
     logger.info("🧹 Проверка и очистка pending_queue...")
     _ensure_fresh_queue()
 
@@ -428,6 +457,7 @@ def start_scheduler():
     logger.info("⏰ cleanup_old_posts: ежедневно в 03:00 МСК")
 
     _scheduler.start()
+    _scheduler_started = True
     logger.info("✅ Планировщик запущен")
     logger.info("=" * 60)
     return _scheduler
