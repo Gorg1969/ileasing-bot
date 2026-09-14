@@ -33,12 +33,20 @@ jobs:
         run: |
           playwright install chromium --with-deps
 
+      # ✅ ИСПРАВЛЕНИЕ: скачиваем существующую listings.db из ветки state
+      - name: Download existing listings.db from state
+        run: |
+          mkdir -p data
+          echo "Пробуем скачать listings.db из ветки state..."
+          curl -fsSL -o data/listings.db \
+            https://raw.githubusercontent.com/Gorg1969/ileasing-bot/state/data/listings.db \
+            && echo "✅ Скачано: $(stat -c%s data/listings.db) байт" \
+            || echo "⚠️ Не удалось скачать, начинаем с нуля"
+
       - name: Run parser
         run: |
           python -m parser.parser
 
-      # ✅ ИСПРАВЛЕНИЕ: сохраняем свежую БД во временное место,
-      #    чтобы git checkout -B state её не затёр
       - name: Save fresh listings.db
         run: |
           ls -la data/
@@ -52,14 +60,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Переключаемся на ветку state
           git fetch origin state || true
           git checkout -B state
 
-          # Возвращаем свежую БД на место (git её затёр)
           cp /tmp/fresh_listings.db data/listings.db
 
-          # Проверяем, что размер вырос
           echo "Размер БД перед коммитом:"
           stat -c%s data/listings.db
 
