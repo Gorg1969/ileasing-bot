@@ -1,6 +1,19 @@
-playwright==1.44.0
-Pillow>=10.0.0
-requests>=2.31.0
-APScheduler>=3.10.0
-Flask>=3.0.0
-urllib3>=2.0.0
+# Web
+Flask==3.0.0
+
+# HTTP
+requests==2.31.0
+
+# WebSocket для юзербота MAX
+websockets==15.0.1
+
+# Работа с изображениями
+Pillow==10.1.0
+
+# Время
+pytz==2023.3
+
+# Excel (для отчётов)
+openpyxl==3.1.2
+
+# Никаких python-dotenv — всё через os.environ
